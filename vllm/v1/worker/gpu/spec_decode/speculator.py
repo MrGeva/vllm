@@ -69,6 +69,11 @@ class BaseSpeculator(ABC):
     def capture(self) -> None:
         pass
 
+    def warm_replay(self) -> tuple[int, int]:
+        """Replay the graphs captured by capture() once; return
+        (replayed, captured). Speculators without warm replay report none."""
+        return 0, 0
+
     @abstractmethod
     def propose(
         self,

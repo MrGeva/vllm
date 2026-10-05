@@ -21,6 +21,7 @@ from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
+from . import small_m
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 
@@ -164,6 +165,13 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         layer.weight_scale = Parameter(
             weight_scale_swizzled.contiguous(), requires_grad=False
         )
+        # Layers that opt in run decode-sized M through one fused
+        # quantize + split-K launch (small_m.py).
+        layer.mxfp8_small_m_fused = (
+            getattr(layer, "mxfp8_small_m", False)
+            and small_m.is_available()
+            and small_m.supports_shape(N, K)
+        )
 
     def apply_weights(
         self,
@@ -174,6 +182,16 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         weight = layer.weight  # [K, N], column-major
         weight_scale = layer.weight_scale
         K, N = weight.shape
+
+        if (
+            getattr(layer, "mxfp8_small_m_fused", False)
+            and isinstance(x, torch.Tensor)
+            and x.dtype == torch.bfloat16
+        ):
+            output = small_m.mxfp8_linear(x.reshape(-1, K), weight, weight_scale)
+            if bias is not None:
+                output = output + bias
+            return output.view(*x.shape[:-1], N)
 
         qa = as_quantized_activation(x, self.input_quant_key())
         if qa is not None:

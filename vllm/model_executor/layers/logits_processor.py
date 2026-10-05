@@ -16,9 +16,18 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.vocab_parallel_argmax import (
+    fused_vocab_parallel_argmax,
+    supports_fused_argmax,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
+)
+from vllm.model_executor.layers.vocab_parallel_logits import (
+    fused_vocab_parallel_logits,
+    max_rows_from_config,
+    supports_fused_logits,
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
@@ -94,6 +103,8 @@ class LogitsProcessor(PluggableLayer):
         # required for RL training-inference consistency.
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        # Logits rows per step, for the symmetric-memory logits gather.
+        self.max_logits_rows = max_rows_from_config(get_current_vllm_config())
 
     def forward(
         self,
@@ -184,6 +195,22 @@ class LogitsProcessor(PluggableLayer):
         embedding_bias: torch.Tensor | None,
         skip_gather: bool = False,
     ) -> torch.Tensor | None:
+        if (
+            not skip_gather
+            and lm_head.tp_size > 1
+            and self.use_all_gather
+            and embedding_bias is None
+            and self.head_dtype in (None, hidden_states.dtype)
+            and hidden_states.dim() == 2
+            and supports_fused_logits(lm_head, hidden_states)
+        ):
+            # The same bf16 logits, gathered through symmetric memory (and
+            # computed by an exact GEMV that pushes them to every rank).
+            logits = fused_vocab_parallel_logits(
+                lm_head, hidden_states, self.max_logits_rows
+            )
+            if logits is not None:
+                return logits[..., : self.org_vocab_size]
         # Get the logits for the next tokens.
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         if skip_gather:
@@ -208,13 +235,33 @@ class LogitsProcessor(PluggableLayer):
 
         Each TP rank computes local argmax, then only the (value, index) pairs
         are gathered and reduced. Communication: O(batch * 2 * tp_size) vs
-        O(batch * vocab_size).
+        O(batch * vocab_size). An unscaled bf16 head instead runs one fused
+        GEMV + argmax kernel with the same result (``vocab_parallel_argmax``).
         """
         if self.scale <= 0.0 and self.scale != 1.0:
             raise ValueError(
                 "The local argmax reduction optimization is not supported for "
                 "non-positive logit scaling factors."
             )
+        if (
+            embedding_bias is None
+            and self.scale == 1.0
+            and self.soft_cap is None
+            and self.head_dtype in (None, hidden_states.dtype)
+            and hidden_states.dim() == 2
+            and supports_fused_argmax(lm_head, hidden_states)
+        ):
+            top_tokens = fused_vocab_parallel_argmax(lm_head, hidden_states)
+            if top_tokens is not None:
+                return top_tokens
+        return self._stock_top_tokens(lm_head, hidden_states, embedding_bias)
+
+    def _stock_top_tokens(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
         tp_size = lm_head.tp_size
 
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)

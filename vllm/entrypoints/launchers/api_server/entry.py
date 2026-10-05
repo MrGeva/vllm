@@ -12,7 +12,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-import vllm.envs as envs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.logger import configure_logging_from_args, init_logger
@@ -23,7 +22,10 @@ from vllm.utils.system_utils import decorate_logs
 
 from ..app import build_app
 from ..launcher import serve_http, setup_server
-from ..utils.server_utils import get_uvicorn_log_config
+from ..utils.server_utils import (
+    get_http_timeout_keep_alive,
+    get_uvicorn_log_config,
+)
 from .app_state import init_app_state
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -145,7 +147,7 @@ async def build_and_serve(
         # NOTE: When the 'disable_uvicorn_access_log' value is True,
         # no access log will be output.
         access_log=not args.disable_uvicorn_access_log,
-        timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+        timeout_keep_alive=get_http_timeout_keep_alive(),
         ssl_keyfile=args.ssl_keyfile,
         ssl_certfile=args.ssl_certfile,
         ssl_ca_certs=args.ssl_ca_certs,

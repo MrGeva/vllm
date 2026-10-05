@@ -113,6 +113,7 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: IndexerKVDType = "bf16",
         backend_cls: type[AttentionBackend] = MiniMaxM3IndexerBackend,
+        tp_shard: int = 1,
     ) -> None:
         super().__init__()
         if indexer_kv_dtype in ("fp8", "fp8_e4m3"):
@@ -131,6 +132,9 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self.dtype = cache_dtype
         self.prefix = prefix
         self.cache_config = cache_config
+        # > 1: the TP ranks shard every block's tokens (rank r keeps tokens
+        # r, r + tp_shard, ...), see nvidia/idxk_shard.py.
+        self.tp_shard = tp_shard
         # Impl-chosen backend -> each impl gets its own builder (get_attn_backend).
         self.backend_cls = backend_cls
         compilation_config = get_current_vllm_config().compilation_config
@@ -140,16 +144,35 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
-        self.kv_cache = kv_cache.squeeze(1)
+        kv_cache = kv_cache.squeeze(1)
+        if self.tp_shard > 1:
+            # Packed [B, N, D / tp] page -> [B, N / tp, D] token rows; the
+            # fused insert kernel addresses rows flat, so blocks must be dense.
+            num_blocks, block_size, content = kv_cache.shape
+            rows = block_size // self.tp_shard
+            assert content * self.tp_shard == self.head_dim
+            assert kv_cache.stride(0) == block_size * content
+            assert kv_cache.stride(1) == content and kv_cache.stride(2) == 1
+            kv_cache = torch.as_strided(
+                kv_cache,
+                (num_blocks, rows, self.head_dim),
+                (kv_cache.stride(0), self.head_dim, 1),
+            )
+        self.kv_cache = kv_cache
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # Key-only: MLAAttentionSpec budgets one vector/token (not 2x for K+V).
+        # Key-only: MLAAttentionSpec budgets one vector/token (not 2x for K+V);
+        # a sharded cache budgets 1 / tp_shard of it per rank.
+        content = None
+        if self.tp_shard > 1:
+            content = self.head_dim * self.dtype.itemsize // self.tp_shard
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
             cache_role=SparseCacheRole.INDEXER,
+            state_content_bytes=content,
         )
 
     def forward(self) -> None: ...
@@ -356,6 +379,7 @@ class MiniMaxM3IndexerImpl(nn.Module):
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: IndexerKVDType = "bf16",
         topk_indices_buffer: torch.Tensor | None = None,
+        index_k_shard: int = 1,
     ) -> None:
         super().__init__()
         self.num_kv_heads = num_kv_heads
@@ -390,6 +414,7 @@ class MiniMaxM3IndexerImpl(nn.Module):
             cache_config=cache_config,
             indexer_kv_dtype=indexer_kv_dtype,
             backend_cls=type(self).indexer_backend_cls,
+            tp_shard=index_k_shard,
         )
 
     def forward(
@@ -573,6 +598,7 @@ class MiniMaxM3Indexer(nn.Module):
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: IndexerKVDType = "bf16",
         topk_indices_buffer: torch.Tensor | None = None,
+        index_k_shard: int = 1,
     ) -> None:
         super().__init__()
         impl_cls = select_indexer_impl_cls(
@@ -593,6 +619,7 @@ class MiniMaxM3Indexer(nn.Module):
             cache_config=cache_config,
             indexer_kv_dtype=indexer_kv_dtype,
             topk_indices_buffer=topk_indices_buffer,
+            index_k_shard=index_k_shard,
         )
 
     @property

@@ -66,6 +66,21 @@ def get_uvicorn_log_config(args: Namespace) -> dict | None:
     return None
 
 
+# Idle keep-alive when VLLM_HTTP_TIMEOUT_KEEP_ALIVE is unset. Pooling HTTP
+# clients reuse an idle connection without knowing the server's timeout
+# (aiohttp keeps idle connections for 15 s by default, AIPerf for 300 s). A
+# request written while the server closes that connection is reset by the
+# peer, and a POST is not retried, so the server must outlive the client.
+DEFAULT_HTTP_TIMEOUT_KEEP_ALIVE = 900
+
+
+def get_http_timeout_keep_alive() -> int:
+    """Seconds the HTTP server keeps an idle keep-alive connection open."""
+    if envs.is_set("VLLM_HTTP_TIMEOUT_KEEP_ALIVE"):
+        return envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+    return DEFAULT_HTTP_TIMEOUT_KEEP_ALIVE
+
+
 _running_tasks: set[asyncio.Task] = set()
 
 

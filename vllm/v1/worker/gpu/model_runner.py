@@ -38,7 +38,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -82,6 +82,7 @@ from vllm.v1.watermarking.spec_decode import (
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.gpu import mixed_attn_timer
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
@@ -162,6 +163,10 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     get_max_chunk_logits,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.target_head_topk import (
+    TargetHeadTopk,
+    enabled as target_head_topk_enabled,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -320,6 +325,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
+        # Verify sampling from the target head's exact top-k candidates
+        # (VLLM_MM3_TARGET_HEAD_TOPK=1), created in load_model().
+        self.target_head_topk: TargetHeadTopk | None = None
         self.batch_sharder: BatchSharder | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -490,6 +498,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vllm_config.watermark_config
                     ),
                 )
+                if target_head_topk_enabled():
+                    self.target_head_topk = TargetHeadTopk(self.model)
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 self.device,
@@ -959,6 +969,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # during actual execution.
         assert self.sampler is not None
         self.sampler(logits, dummy_input_batch)
+        if isinstance(self.rejection_sampler, RejectionSampler):
+            self.rejection_sampler.warmup_topk_path(
+                logits,
+                self.speculator.draft_logits if self.speculator is not None else None,
+                token_dtype=self.input_buffers.input_ids.dtype,
+                position_dtype=self.input_buffers.positions.dtype,
+            )
+        if self.target_head_topk is not None:
+            self.target_head_topk.warmup(
+                hidden_states,
+                self.num_speculative_steps + 1,
+                token_dtype=self.input_buffers.input_ids.dtype,
+                position_dtype=self.input_buffers.positions.dtype,
+            )
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
@@ -1094,7 +1118,39 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        if capture_decoder and not profile_only:
+            self._warm_replay_cudagraphs()
         return cuda_graph_size
+
+    def _warm_replay_cudagraphs(self) -> None:
+        """Replay every captured target and draft graph once before serving.
+
+        Capture never executes a FULL graph or the graph segments of a
+        PIECEWISE graph, so the one-time device work of each graph's first
+        execution would otherwise land on its first replay under live traffic,
+        with KV-offload copies in flight and the ranks out of lockstep. Run it
+        here instead, with the KV connector idle, then synchronize the device
+        and the TP group.
+        """
+        assert self.cudagraph_manager is not None
+        start_time = time.perf_counter()
+        with self.maybe_setup_dummy_loras(self.lora_config):
+            target = self.cudagraph_manager.warm_replay()
+            draft = (0, 0)
+            if self.speculator is not None:
+                with use_workspace_lane(self._draft_workspace_lane):
+                    draft = self.speculator.warm_replay()
+        torch.accelerator.synchronize()
+        get_tp_group().barrier()
+        logger.info(
+            "Warm-replayed %d of %d captured CUDA graphs (target %d/%d, "
+            "drafter %d/%d) in %.1f secs",
+            target[0] + draft[0],
+            target[1] + draft[1],
+            *target,
+            *draft,
+            time.perf_counter() - start_time,
+        )
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
@@ -1575,6 +1631,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
+            if self.target_head_topk is not None and grammar_output is None:
+                # The target head's exact top-k candidates instead of its full
+                # logits, when every request is on the sort-free top-k path.
+                screened = self.target_head_topk.verify(
+                    sample_hidden_states,
+                    input_batch,
+                    self.rejection_sampler,
+                    self.speculator,
+                )
+                if screened is not None:
+                    return screened, screened.num_sampled, screened.num_rejected
             logits = self.model.compute_logits(sample_hidden_states)
 
         # A diffusion prefill has no logit rows even when a bitmask row
@@ -1682,6 +1749,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Opt-in mixed-step timer: builders re-arm it for this step's batch.
+        mixed_timer = mixed_attn_timer.get()
+        if mixed_timer is not None:
+            mixed_timer.disarm()
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1943,6 +2014,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
         self.step_timing.forward_start()
+        if mixed_timer is not None and not dummy_run:
+            mixed_timer.begin_fwd()
 
         connector_kwargs = dict(
             scheduler_output=scheduler_output,
@@ -2002,6 +2075,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if mixed_timer is not None:
+            mixed_timer.end_fwd()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

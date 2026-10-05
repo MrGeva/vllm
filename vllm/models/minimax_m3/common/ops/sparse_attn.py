@@ -21,9 +21,14 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import num_compute_units
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
+
+# Resident programs per SM for _gqa_sparse_decode_kernel (4 warps, 16x128 q
+# tile, 128x128 K/V tiles): registers cap it at 2 on sm_90/sm_100.
+_DECODE_CTAS_PER_SM = 2
 
 _FP8_DTYPES = (
     torch.float8_e4m3fn,
@@ -321,6 +326,15 @@ def _gqa_sparse_decode_kernel(
         order=(1, 0),
     )
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    if USE_FP8 and KV_SCALE_MODE != 2:
+        # fp8 -> fp16 is exact (e4m3/e5m2), so run both dots in fp16: the
+        # per-block dequant is then one convert per element instead of
+        # fp8 -> f16 -> bf16 plus a scale multiply and repack. Scalar K/V
+        # scales fold into the qk scale and the output. q is clamped to the
+        # fp16 range so an outlier cannot turn into inf.
+        q = tl.clamp(q.to(tl.float32), -65504.0, 65504.0).to(tl.float16)
+        if KV_SCALE_MODE == 1:
+            sm_scale_log2e = sm_scale_log2e * tl.load(k_scale_ptr)
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
@@ -341,9 +355,7 @@ def _gqa_sparse_decode_kernel(
         )
         if USE_FP8:
             k = k.to(q.dtype)
-            if KV_SCALE_MODE == 1:
-                k = (k * tl.load(k_scale_ptr)).to(q.dtype)
-            elif KV_SCALE_MODE == 2:
+            if KV_SCALE_MODE == 2:
                 k_scale = tl.load(
                     k_scale_ptr
                     + pid_kh * stride_ks_h
@@ -370,9 +382,7 @@ def _gqa_sparse_decode_kernel(
         )
         if USE_FP8:
             v = v.to(q.dtype)
-            if KV_SCALE_MODE == 1:
-                v = (v * tl.load(v_scale_ptr)).to(q.dtype)
-            elif KV_SCALE_MODE == 2:
+            if KV_SCALE_MODE == 2:
                 v_scale = tl.load(
                     v_scale_ptr
                     + pid_kh * stride_vs_h
@@ -391,6 +401,8 @@ def _gqa_sparse_decode_kernel(
     # Empty chunks for active rows must store zero output; otherwise the merge
     # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
+    if USE_FP8 and KV_SCALE_MODE == 1:
+        scale = scale * tl.load(v_scale_ptr)
     acc_o = acc_o * scale[:, None]
     o_ptrs = tl.make_block_ptr(
         base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
@@ -413,7 +425,10 @@ def _gqa_sparse_decode_kernel(
 
 
 @triton.heuristics(
-    {"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])}
+    {
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "BLOCK_SIZE_C": lambda args: triton.next_power_of_2(args["NUM_TOPK_CHUNKS"]),
+    }
 )
 @triton.jit
 def _merge_topk_attn_out_kernel(
@@ -434,6 +449,7 @@ def _merge_topk_attn_out_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     USE_PDL: tl.constexpr,
+    BLOCK_SIZE_C: tl.constexpr,  # NUM_TOPK_CHUNKS padded to a power of two
 ):
     pid_b, pid_h = tl.program_id(0), tl.program_id(1)
 
@@ -442,19 +458,20 @@ def _merge_topk_attn_out_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    off_c = tl.arange(0, NUM_TOPK_CHUNKS)
+    off_c = tl.arange(0, BLOCK_SIZE_C)
     off_d = tl.arange(0, BLOCK_SIZE_D)
     o_ptrs = tl.make_block_ptr(
         base=o_ptr + pid_b * stride_o_b + pid_h * stride_o_h,
         shape=(NUM_TOPK_CHUNKS, head_dim),
         strides=(stride_o_c, stride_o_d),
         offsets=(0, 0),
-        block_shape=(NUM_TOPK_CHUNKS, BLOCK_SIZE_D),
+        block_shape=(BLOCK_SIZE_C, BLOCK_SIZE_D),
         order=(1, 0),
     )
     lse_ptrs = lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h + off_c * stride_l_c
     o = tl.load(o_ptrs, boundary_check=(0, 1), padding_option="zero")
-    lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
+    # empty and padding chunks contribute -inf -> weight 0
+    lse = tl.load(lse_ptrs, mask=off_c < NUM_TOPK_CHUNKS, other=float("-inf"))
     lse_max = tl.max(lse, axis=0)
     weights = tl.exp2(lse - lse_max)
     weights = weights / tl.sum(weights, axis=0)
@@ -645,9 +662,13 @@ def minimax_m3_sparse_attn_decode(
     # actually supported -- on ROCm use_pdl is always False, so it's omitted.
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
     # split-K over the selected blocks; chunk count is shape-constant (cuda graph).
-    TARGET_GRID = 256
-    target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
-    num_topk_chunks = 1 << (target.bit_length() - 1)
+    # Fill one wave of resident programs and split as finely as fits, so each
+    # program walks as few blocks serially as possible. The chunk count need not
+    # be a power of two: e.g. at 1 KV head and q_len 4 on 148 SMs, 9 decodes
+    # take 2 blocks per program and 10-12 take 3, instead of 4.
+    resident = _DECODE_CTAS_PER_SM * num_compute_units(q.device.index or 0)
+    target = max(1, min(max_topk, resident // max(1, total_q * num_kv_heads)))
+    num_topk_chunks = triton.cdiv(max_topk, triton.cdiv(max_topk, target))
     o_partial = torch.empty(
         num_topk_chunks, total_q, num_heads, head_dim, dtype=q.dtype, device=q.device
     )

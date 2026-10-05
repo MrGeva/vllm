@@ -565,6 +565,18 @@ class TrtLlmNvFp4ExpertsMonolithic(
         # dummy 0-token forward has to keep the finalized (empty) form.
         defer = self.moe_config.should_defer_moe_finalize(num_tokens)
 
+        # FlashInfer's autotuner keys on every input shape, including `output`,
+        # which a deferred call leaves as a zero-width placeholder, so deferred
+        # calls get their own separately tuned GEMM tactics. A consumer that
+        # wants both forms to run the same GEMMs sets
+        # `defer_reuses_finalized_tactics`: the deferred call then passes a
+        # finalized-shape buffer, which the kernel never writes without finalize.
+        output = None
+        if defer and getattr(self.moe_config, "defer_reuses_finalized_tactics", False):
+            output = hidden_states.new_empty(
+                (num_tokens, self.moe_config.hidden_dim), dtype=torch.bfloat16
+            )
+
         routing_replay_out = self._maybe_make_routing_replay_buffer(
             num_tokens=num_tokens,
             device=hidden_states.device,
@@ -605,6 +617,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
             per_token_scale=per_token_scale,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
             routing_replay_out=routing_replay_out,
+            output=output,
         )
         routed_output = convert_flashinfer_moe_output(
             flashinfer_output,

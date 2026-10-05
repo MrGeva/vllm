@@ -51,6 +51,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.gpu import mixed_attn_timer
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -781,6 +782,7 @@ def unified_attention_with_output(
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
 
+    timer_token = mixed_attn_timer.span_start()
     self.impl.forward(
         self,
         query,
@@ -792,6 +794,7 @@ def unified_attention_with_output(
         output_scale=output_scale,
         output_block_scale=output_block_scale,
     )
+    mixed_attn_timer.span_end("dat", timer_token)
 
 
 direct_register_custom_op(

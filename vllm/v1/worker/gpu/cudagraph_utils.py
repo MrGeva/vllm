@@ -183,6 +183,11 @@ class CudaGraphManager:
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
 
+        # Captured descriptors in capture order and the factory that captured
+        # them, so warm_replay() can rerun each graph on its capture inputs.
+        self._captured_descs: list[BatchExecutionDescriptor] = []
+        self._create_forward_fn: CreateForwardFn | None = None
+
         # Breakable CUDA graph (PW CUDA graph without torch.compile)
         self.use_breakable_cg = (
             is_breakable_cudagraph_enabled()
@@ -398,6 +403,7 @@ class CudaGraphManager:
         """
         self.graphs.clear()
         self._graphs_captured = False
+        self._captured_descs.clear()
         if self.breakable_cg_runner is not None:
             BreakableCUDAGraphWrapper.clear_all_graphs()
 
@@ -428,6 +434,8 @@ class CudaGraphManager:
             progress_bar_desc: Description shown on the capture progress bar.
 
         """
+        self._create_forward_fn = create_forward_fn
+        self._captured_descs = []
         with graph_capture(device=self.device), ExitStack() as stack:
             if self.ubatch_runner is not None:
                 # Join parked threads on failure to avoid blocking later captures.
@@ -468,11 +476,13 @@ class CudaGraphManager:
                         and not self.use_breakable_cg
                     ):
                         forward_fn(CUDAGraphMode.PIECEWISE)
+                        self._captured_descs.append(desc)
                     else:
                         # Capture with fresh attention state.
                         forward_fn = create_forward_fn(desc, warmup=False)
                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                             forward_fn(CUDAGraphMode.PIECEWISE)
+                            self._captured_descs.append(desc)
                             continue
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
@@ -502,9 +512,43 @@ class CudaGraphManager:
                             free_after = torch.accelerator.get_memory_info()[0]
                             self._capture_mem_samples.append(free_before - free_after)
                         self.graphs[desc] = graph
+                        self._captured_descs.append(desc)
                         compilation_counter.num_cudagraph_captured += 1
 
         self._graphs_captured = True
+
+    @torch.inference_mode()
+    def warm_replay(self) -> tuple[int, int]:
+        """Replay every captured graph once and return (replayed, captured).
+
+        Capture records FULL graphs and the graph segments of PIECEWISE graphs
+        without executing them, so the one-time device work of a graph's first
+        execution would otherwise happen on its first replay while serving.
+        Graphs are replayed in capture order, each on the dummy inputs and
+        forward context of its capture pass and synchronized before the next,
+        so every rank issues the same collectives in the same order.
+        Microbatched (DBO) graphs need the microbatch threads and are skipped.
+        """
+        create_forward_fn = self._create_forward_fn
+        num_captured = len(self._captured_descs)
+        if create_forward_fn is None:
+            return 0, num_captured
+        num_replayed = 0
+        for desc in self._captured_descs:
+            if desc.num_ubatches > 1:
+                continue
+            # Rebuilds the capture-time dummy metadata in the persistent
+            # buffers that the graph reads.
+            forward_fn = create_forward_fn(desc, warmup=False)
+            if desc.cg_mode == CUDAGraphMode.FULL:
+                self.run_fullgraph(desc)
+            else:
+                # Replays the captured PIECEWISE graph: its batch descriptor
+                # already has an entry.
+                forward_fn(CUDAGraphMode.PIECEWISE)
+            torch.accelerator.synchronize()
+            num_replayed += 1
+        return num_replayed, num_captured
 
     def captured_token_counts(self) -> list[int]:
         """Sorted token counts with a captured graph, ignoring LoRA variants."""

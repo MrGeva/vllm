@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.attention import MiniMaxM3MSADecodeBackend
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -34,11 +34,13 @@ from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
     should_prepare_decode_metadata,
     supports_cutlass_sparse_decode,
 )
+from vllm.models.minimax_m3.nvidia.ops import k2q_csr
 from vllm.v1.attention.backend import (
     AttentionLayer,
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.worker.gpu import mixed_attn_timer
 
 logger = init_logger(__name__)
 
@@ -178,6 +180,17 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
             "MiniMax M3 MSA sparse decode selected %s",
             "CUTLASS" if self.use_cutlass_decode else "Triton",
         )
+        # One-launch k2q CSR + schedule for the prefill rows (stock builder
+        # for unsupported shapes, or when disabled or unavailable).
+        self.k2q_builder: k2q_csr.K2qCsrBuilder | None = None
+        if self.num_kv_heads == 1 and topk_blocks == k2q_csr.TOPK:
+            try:
+                if k2q_csr.enabled(get_current_vllm_config()):
+                    self.k2q_builder = k2q_csr.get_builder(
+                        torch.device("cuda", torch.cuda.current_device())
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning_once("MiniMax M3 one-launch k2q CSR disabled: %r", e)
 
     def should_use_msa_decode(self, layer_name: str) -> bool:
         if not self.use_cutlass_decode:
@@ -226,6 +239,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
 
         # Decode [:nd]: CUTLASS for planned shapes, otherwise Triton.
         if main_md.num_decodes > 0:
+            timer_token = mixed_attn_timer.span_start()
             d = main_md.decode
             assert d is not None
             msa_metadata = (
@@ -260,6 +274,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                     k_scale=k_scale,
                     v_scale=v_scale,
                 )
+            mixed_attn_timer.span_end("adec", timer_token)
 
         # Prefill [nd:]: MSA sparse FMHA over the selected blocks.
         if main_md.num_prefills > 0:
@@ -275,18 +290,35 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
             prefill_topk = topk[nd:num_tokens].transpose(0, 1)
             qp = q[nd:]
             k_cache, v_cache = kv_cache.split(self.head_size, dim=-1)
-            k2q_row_ptr, k2q_q_indices, schedule = build_k2q_csr(
-                prefill_topk,
-                p.cu_seqlens_q,
-                p.cu_seqlens_k,
-                SPARSE_BLOCK_SIZE,
-                total_k=0,
-                max_seqlen_k=p.max_seq_len,
-                max_seqlen_q=p.max_query_len,
-                total_rows=p.total_kv_blocks,
-                qhead_per_kv=qp.shape[1] // self.num_kv_heads,
-                return_schedule=True,
-            )
+            timer_token = mixed_attn_timer.span_start()
+            builder = self.k2q_builder
+            if builder is not None and builder.supports(
+                prefill_topk, p.total_kv_blocks, p.cu_seqlens_q.shape[0] - 1
+            ):
+                k2q_row_ptr, k2q_q_indices, schedule = builder.build(
+                    prefill_topk,
+                    p.cu_seqlens_q,
+                    p.cu_seqlens_k,
+                    p.max_seq_len,
+                    p.max_query_len,
+                    p.total_kv_blocks,
+                    qhead_per_kv=qp.shape[1] // self.num_kv_heads,
+                )
+            else:
+                k2q_row_ptr, k2q_q_indices, schedule = build_k2q_csr(
+                    prefill_topk,
+                    p.cu_seqlens_q,
+                    p.cu_seqlens_k,
+                    SPARSE_BLOCK_SIZE,
+                    total_k=0,
+                    max_seqlen_k=p.max_seq_len,
+                    max_seqlen_q=p.max_query_len,
+                    total_rows=p.total_kv_blocks,
+                    qhead_per_kv=qp.shape[1] // self.num_kv_heads,
+                    return_schedule=True,
+                )
+            mixed_attn_timer.span_end("k2q", timer_token)
+            timer_token = mixed_attn_timer.span_start()
             sparse_atten_func(
                 qp,
                 k_cache,
@@ -306,4 +338,5 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                 schedule=schedule,
                 out=out[nd:],
             )
+            mixed_attn_timer.span_end("spa", timer_token)
         return output

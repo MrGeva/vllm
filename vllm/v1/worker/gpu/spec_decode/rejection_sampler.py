@@ -24,6 +24,11 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
+from vllm.v1.worker.gpu.spec_decode.topk_rejection_sampler import (
+    topk_path_eligible_requests,
+    topk_rejection_sample,
+    warmup_topk_rejection_sample,
+)
 
 # Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
 # TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
@@ -234,6 +239,63 @@ class RejectionSampler:
             "watermark_key": self.watermark_key,
         }
 
+    def _topk_path_supported(
+        self, logits: torch.Tensor, draft_logits: torch.Tensor | None
+    ) -> bool:
+        """The batch-independent conditions of topk_rejection_sample."""
+        return not (
+            draft_logits is not None
+            or self.use_block_verification
+            or self.watermark_key is not None
+            or self.enable_adaptive_verification
+            or self.sampler.use_fp64_gumbel
+            or logits.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+            or logits.stride(-1) != 1
+        )
+
+    def warmup_topk_path(
+        self,
+        logits: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        token_dtype: torch.dtype,
+        position_dtype: torch.dtype,
+    ) -> None:
+        """Compile the topk_rejection_sample kernels before serving. The
+        kernel warmup's sampling params (min_p, logprobs, penalties) never
+        select that path, so its first eligible batch would compile them."""
+        if self._topk_path_supported(logits, draft_logits):
+            warmup_topk_rejection_sample(
+                logits,
+                self.num_speculative_steps,
+                self.synthetic_conditional_rates,
+                token_dtype,
+                position_dtype,
+            )
+
+    def _use_topk_path(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+        max_num_logprobs: int,
+    ) -> bool:
+        """Whether every request samples from temperature plus a small top-k
+        (and optional top-p) only, so topk_rejection_sample applies."""
+        if (
+            input_batch.has_structured_output_reqs
+            or max_num_logprobs != NO_LOGPROBS
+            or not self._topk_path_supported(logits, draft_logits)
+        ):
+            return False
+        states = self.sampler.sampling_states
+        idx_mapping_np = input_batch.idx_mapping_np
+        return topk_path_eligible_requests(
+            states.temperature.np[idx_mapping_np],
+            states.top_k.np[idx_mapping_np],
+            states.min_p.np[idx_mapping_np],
+            self.sampler.uses_logits_processors[idx_mapping_np],
+        )
+
     def _verify(
         self,
         logits: torch.Tensor,
@@ -378,16 +440,37 @@ class RejectionSampler:
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
             input_batch.idx_mapping_np
         )
-        chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
-        sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
-            logits,
-            input_batch,
-            draft_logits,
-            draft_sampled,
-            pos,
-            chunk_logit_limit,
-            max_num_logprobs,
-        )
+        logprobs_tensors: LogprobsTensors | None = None
+        if self._use_topk_path(logits, input_batch, draft_logits, max_num_logprobs):
+            states = self.sampler.sampling_states
+            sampled, num_sampled = topk_rejection_sample(
+                logits,
+                draft_sampled,
+                input_batch.cu_num_logits,
+                pos,
+                input_batch.idx_mapping,
+                input_batch.expanded_idx_mapping,
+                states.temperature.gpu,
+                states.top_k.gpu,
+                states.top_p.gpu,
+                states.seeds.gpu,
+                self.num_speculative_steps,
+                topp_enabled=bool(
+                    np.any(states.top_p.np[input_batch.idx_mapping_np] != 1.0)
+                ),
+                synthetic_conditional_rates=self.synthetic_conditional_rates,
+            )
+        else:
+            chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+            sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+                logits,
+                input_batch,
+                draft_logits,
+                draft_sampled,
+                pos,
+                chunk_logit_limit,
+                max_num_logprobs,
+            )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,

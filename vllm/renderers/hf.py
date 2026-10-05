@@ -44,7 +44,11 @@ from vllm.multimodal.processing.processor import (
     apply_token_matches,
     find_mm_placeholders,
 )
-from vllm.tokenizers.hf import HfTokenizer, maybe_make_thread_pool
+from vllm.tokenizers.hf import (
+    HfTokenizer,
+    SegmentedPromptEncoder,
+    maybe_make_thread_pool,
+)
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils.async_utils import make_async
@@ -63,7 +67,12 @@ if TYPE_CHECKING:
         ChatTemplateContentFormatOption,
         ConversationMessage,
     )
-    from vllm.inputs import MultiModalDataDict, MultiModalUUIDDict, TokensPrompt
+    from vllm.inputs import (
+        MultiModalDataDict,
+        MultiModalUUIDDict,
+        TextPrompt,
+        TokensPrompt,
+    )
     from vllm.inputs.engine import TokensInput
     from vllm.multimodal.processing.processor import (
         MultiModalPromptUpdates,
@@ -71,7 +80,7 @@ if TYPE_CHECKING:
     )
 
     from .inputs import DictPrompt
-    from .params import ChatParams
+    from .params import ChatParams, TokenizeParams
 
 logger = init_logger(__name__)
 
@@ -969,9 +978,39 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 self.tokenizer, config.model_config.renderer_num_workers + 1
             )
 
+        # Prompt embeds can add a placeholder token after this point.
+        self._segmented_encoder = (
+            SegmentedPromptEncoder.maybe_create(
+                self.tokenizer, config.model_config.renderer_num_workers
+            )
+            if self.tokenizer is not None
+            and not getattr(config.model_config, "enable_prompt_embeds", False)
+            else None
+        )
+        if self._segmented_encoder is not None:
+            logger.info(
+                "Tokenizing prompts of %d+ characters in segments split at "
+                "added tokens, with a %d MiB segment cache.",
+                SegmentedPromptEncoder.MIN_CHARS,
+                SegmentedPromptEncoder.CACHE_BYTES >> 20,
+            )
+
     def _can_produce_offsets(self) -> bool:
         # Only fast tokenizers expose offset_mapping.
         return self.tokenizer is not None and self.tokenizer.is_fast
+
+    def _tokenize_prompt(
+        self,
+        prompt: TextPrompt,
+        params: TokenizeParams,
+    ) -> TokensPrompt:
+        encoder = self._segmented_encoder
+        if encoder is not None and not self._wants_offsets(prompt, params):
+            token_ids = encoder.encode(prompt["prompt"], **params.get_encode_kwargs())
+            if token_ids is not None:
+                return self._build_tokens_prompt(token_ids, prompt)
+
+        return super()._tokenize_prompt(prompt, params)
 
     def render_messages(
         self,

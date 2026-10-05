@@ -193,6 +193,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
 
+    def warm_replay(self) -> tuple[int, int]:
+        # Same index reset and hooks as capture(), so the replays read the
+        # buffer state the graphs were captured with.
+        self.last_token_indices.zero_()
+        self.idx_mapping.zero_()
+        assert self.prefill_cudagraph_manager is not None
+        self.on_prefill_begin(self.max_num_reqs)
+        replayed, captured = self.prefill_cudagraph_manager.warm_replay()
+        self.on_prefill_end(self.max_num_reqs)
+        if self.num_speculative_steps == 1:
+            return replayed, captured
+
+        assert self.decode_cudagraph_manager is not None
+        self.on_multi_step_decode_begin(self.max_num_reqs)
+        decode_replayed, decode_captured = self.decode_cudagraph_manager.warm_replay()
+        self.on_multi_step_decode_end(self.max_num_reqs)
+        return replayed + decode_replayed, captured + decode_captured
+
     @torch.inference_mode()
     def propose(
         self,
@@ -238,9 +256,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # seq_lens) of the target model.
         if aux_hidden_states:
             assert self.method == "eagle3"
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            combine_aux = getattr(self.model, "combine_aux_hidden_states", None)
+            if combine_aux is not None:
+                hidden_states = combine_aux(aux_hidden_states)
+            else:
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
         else:
             hidden_states = last_hidden_states
         self._copy_request_inputs(
@@ -480,6 +502,27 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
                 last_hidden_states, hidden_states
             )
+        elif self._advance_draft_step():
+            # One kernel for the gathers and copies below (same values).
+            sample_hidden_states = prefill_gather(
+                last_token_indices,
+                last_hidden_states,
+                hidden_states,
+                self.hidden_states,
+                self.input_buffers.positions,
+                self.sample_src_positions,
+                self.max_num_reqs,
+            )
+            self.draft_tokens[:num_reqs, 0] = self.sample_draft(
+                sample_hidden_states,
+                self.sample_src_positions[:num_reqs],
+                idx_mapping,
+                self.temperature,
+                self.seeds,
+                self.current_draft_step,
+                self.draft_logits,
+            )
+            return
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
@@ -613,8 +656,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             else []
         )
 
+        advance_step = self._advance_draft_step()
+        if advance_step:
+            # update_draft_inputs advances the step after every pass.
+            self.current_draft_step.fill_(1)
         for step in range(1, self.num_speculative_steps):
-            self.current_draft_step.fill_(step)
+            if not advance_step:
+                self.current_draft_step.fill_(step)
             self._generate_draft(
                 num_reqs,
                 num_tokens_padded,
@@ -636,6 +684,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 )
                 for attn_group in attn_groups:
                     attn_group.update_draft_decode_metadata(attn_metadata)
+
+    def _advance_draft_step(self) -> bool:
+        """Whether update_draft_inputs advances current_draft_step itself, so
+        the fused decode loop fills it once instead of before every pass. The
+        fused EAGLE3 draft opts in (VLLM_EAGLE3_DRAFT_FUSION part ``steps``)."""
+        fusion = getattr(getattr(self.model, "model", None), "_draft_fusion", None)
+        return (
+            fusion is not None
+            and "steps" in fusion.parts
+            and type(self)._generate_draft is AutoRegressiveSpeculator._generate_draft
+        )
 
     def _generate_draft(
         self,
@@ -684,6 +743,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.max_model_len,
             self.num_speculative_steps,
             advance_draft_positions=self.advance_draft_positions,
+            advance_step=self._advance_draft_step(),
         )
 
 
@@ -976,8 +1036,33 @@ def update_draft_inputs(
     max_model_len: int,
     num_speculative_steps: int,
     advance_draft_positions: bool = True,
+    advance_step: bool = False,
 ):
     _, hidden_size = hidden_states.shape
+    if advance_step:
+        # One program walks the requests, then advances the step: the step
+        # every request reads must not change under a concurrent program.
+        _update_draft_inputs_advance_kernel[(1,)](
+            output_draft_tokens,
+            output_draft_tokens.stride(0),
+            next_input_hidden_states,
+            next_input_hidden_states.stride(0),
+            input_buffers.input_ids,
+            input_buffers.positions,
+            sample_src_positions,
+            input_buffers.seq_lens,
+            draft_tokens,
+            current_draft_step,
+            hidden_states,
+            hidden_states.stride(0),
+            num_reqs,
+            hidden_size,
+            max_model_len,
+            num_speculative_steps,
+            BLOCK_SIZE=1024,
+            ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
+        )
+        return
     _update_draft_inputs_kernel[(num_reqs,)](
         output_draft_tokens,
         output_draft_tokens.stride(0),
@@ -997,3 +1082,145 @@ def update_draft_inputs(
         BLOCK_SIZE=1024,
         ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
     )
+
+
+@triton.jit
+def _update_draft_inputs_advance_kernel(
+    output_draft_tokens_ptr,
+    output_draft_tokens_stride,
+    next_input_hidden_states_ptr,
+    next_input_hidden_states_stride,
+    input_ids_ptr,
+    positions_ptr,
+    sample_src_positions_ptr,
+    seq_lens_ptr,
+    draft_tokens_ptr,
+    current_draft_step_ptr,
+    hidden_states_ptr,
+    hidden_states_stride,
+    num_reqs,
+    hidden_size,
+    max_model_len,
+    num_speculative_steps,
+    BLOCK_SIZE: tl.constexpr,
+    ADVANCE_DRAFT_POSITIONS: tl.constexpr,
+):
+    """_update_draft_inputs_kernel for every request in one program, then
+    current_draft_step += 1 (except after the final step)."""
+    step = tl.load(current_draft_step_ptr)
+    for req_idx in range(0, num_reqs):
+        draft_token = tl.load(draft_tokens_ptr + req_idx)
+        tl.store(
+            output_draft_tokens_ptr + req_idx * output_draft_tokens_stride + step,
+            draft_token,
+        )
+        if step < num_speculative_steps - 1:
+            sample_position = tl.load(sample_src_positions_ptr + req_idx)
+            tl.store(sample_src_positions_ptr + req_idx, sample_position + 1)
+            tl.store(input_ids_ptr + req_idx, draft_token)
+            for i in range(0, hidden_size, BLOCK_SIZE):
+                block = i + tl.arange(0, BLOCK_SIZE)
+                mask = block < hidden_size
+                hs = tl.load(
+                    hidden_states_ptr + req_idx * hidden_states_stride + block,
+                    mask=mask,
+                )
+                tl.store(
+                    next_input_hidden_states_ptr
+                    + req_idx * next_input_hidden_states_stride
+                    + block,
+                    hs,
+                    mask=mask,
+                )
+            if ADVANCE_DRAFT_POSITIONS:
+                position = tl.load(positions_ptr + req_idx)
+                position = tl.minimum(position + 1, max_model_len - 1)
+                tl.store(positions_ptr + req_idx, position)
+                seq_len = tl.load(seq_lens_ptr + req_idx)
+                seq_len = tl.minimum(seq_len + 1, max_model_len)
+                tl.store(seq_lens_ptr + req_idx, seq_len)
+    if step < num_speculative_steps - 1:
+        tl.store(current_draft_step_ptr, step + 1)
+
+
+@triton.jit
+def _prefill_gather_kernel(
+    last_token_indices_ptr,
+    last_hidden_ptr,
+    last_hidden_stride,
+    hidden_ptr,
+    hidden_stride,
+    sample_hidden_ptr,
+    sample_hidden_stride,
+    next_hidden_ptr,
+    next_hidden_stride,
+    positions_ptr,
+    sample_src_positions_ptr,
+    num_reqs,
+    hidden_size,
+    SAME: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    tl.extra.cuda.gdc_wait()
+    tl.extra.cuda.gdc_launch_dependents()
+    li = tl.load(last_token_indices_ptr + req_idx)
+    for i in range(0, hidden_size, BLOCK_SIZE):
+        block = i + tl.arange(0, BLOCK_SIZE)
+        mask = block < hidden_size
+        x = tl.load(last_hidden_ptr + li * last_hidden_stride + block, mask=mask)
+        tl.store(sample_hidden_ptr + req_idx * sample_hidden_stride + block, x, mask=mask)
+        if not SAME:
+            x = tl.load(hidden_ptr + li * hidden_stride + block, mask=mask)
+        tl.store(next_hidden_ptr + req_idx * next_hidden_stride + block, x, mask=mask)
+    if req_idx == 0:
+        # Read every gathered position before overwriting the prefix.
+        r = tl.arange(0, BLOCK_R)
+        rmask = r < num_reqs
+        lt = tl.load(last_token_indices_ptr + r, mask=rmask, other=0)
+        pos = tl.load(positions_ptr + lt, mask=rmask)
+        tl.store(positions_ptr + r, pos, mask=rmask)
+        tl.store(sample_src_positions_ptr + r, pos + 1, mask=rmask)
+
+
+def prefill_gather(
+    last_token_indices: torch.Tensor,
+    last_hidden_states: torch.Tensor,
+    hidden_states: torch.Tensor,
+    next_hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    sample_src_positions: torch.Tensor,
+    max_num_reqs: int,
+) -> torch.Tensor:
+    """_prefill's bookkeeping in one PDL kernel: returns
+    last_hidden_states[last_token_indices] and sets
+    next_hidden_states[:num_reqs] = hidden_states[last_token_indices],
+    positions[:num_reqs] = positions[last_token_indices] and
+    sample_src_positions[:num_reqs] = that + 1."""
+    num_reqs = last_token_indices.shape[0]
+    hidden_size = last_hidden_states.shape[1]
+    out = torch.empty(
+        num_reqs, hidden_size, dtype=last_hidden_states.dtype,
+        device=last_hidden_states.device,
+    )
+    _prefill_gather_kernel[(num_reqs,)](
+        last_token_indices,
+        last_hidden_states,
+        last_hidden_states.stride(0),
+        hidden_states,
+        hidden_states.stride(0),
+        out,
+        out.stride(0),
+        next_hidden_states,
+        next_hidden_states.stride(0),
+        positions,
+        sample_src_positions,
+        num_reqs,
+        hidden_size,
+        SAME=last_hidden_states is hidden_states,
+        BLOCK_R=triton.next_power_of_2(max(max_num_reqs, 1)),
+        BLOCK_SIZE=2048,
+        launch_pdl=True,
+    )
+    return out

@@ -29,6 +29,7 @@ from vllm.model_executor.models.llama import (
 )
 from vllm.multimodal.inputs import NestedTensors
 
+from .eagle3_draft_fusion import Eagle3DraftFusion
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -254,6 +255,7 @@ class LlamaModel(nn.Module):
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
         )
+        self._draft_fusion = Eagle3DraftFusion.maybe_create(self, vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -265,6 +267,10 @@ class LlamaModel(nn.Module):
         hidden_states: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if input_embeds is None and self._draft_fusion is not None:
+            fused = self._draft_fusion.forward(input_ids, positions, hidden_states)
+            if fused is not None:
+                return fused
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids)
         torch._assert(
@@ -393,6 +399,17 @@ class Eagle3LlamaForCausalLM(_Eagle3LlamaForCausalLMBase):
         )
         logits_new[:, targets] = logits
         return logits_new
+
+    def combine_aux_hidden_states(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+    ) -> torch.Tensor:
+        fusion = self.model._draft_fusion
+        if fusion is not None and self.model.use_aux_hidden_state:
+            combined = fusion.combine_aux(aux_hidden_states)
+            if combined is not None:
+                return combined
+        return self.combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))
 
     def combine_hidden_states(
         self,

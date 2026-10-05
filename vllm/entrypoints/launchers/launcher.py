@@ -92,6 +92,7 @@ async def serve_http(
         h11_max_header_count = H11_MAX_HEADER_COUNT_DEFAULT
 
     config = uvicorn.Config(app, **uvicorn_kwargs)
+    logger.info("HTTP keep-alive timeout: %s s", config.timeout_keep_alive)
     # Set header limits
     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size
     config.h11_max_header_count = h11_max_header_count

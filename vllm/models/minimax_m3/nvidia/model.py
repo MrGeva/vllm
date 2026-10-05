@@ -35,6 +35,7 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
@@ -86,6 +87,12 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     select_main_backend_and_impl_cls,
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
+from vllm.models.minimax_m3.nvidia import (
+    idxk_shard,
+    moe_tail_fold,
+    oproj_ar_push,
+    qkv_epilogue_prep,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
@@ -94,6 +101,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.gpu import mixed_attn_timer
 
 
 def _sparse_attention_layer_ids(config: PreTrainedConfig) -> set[int]:
@@ -113,6 +121,13 @@ def _is_moe_layer(config: PreTrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+def _fuse_small_m_mxfp8(*linears: nn.Module) -> None:
+    """Run these MXFP8 projections through the fused quantize + split-K GEMM
+    at decode-sized M (kernels/linear/mxfp8/small_m.py)."""
+    for linear in linears:
+        linear.mxfp8_small_m = True
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -270,18 +285,38 @@ class MiniMaxM3MoE(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.experts",
         )
+        # Whether decode-sized calls leave the top-k finalize, the shared add
+        # and the all-reduce to the next RMSNorm (moe_tail_fold.py).
+        self.tail_fold = not reduce_results and moe_tail_fold.defer_finalize(
+            self.experts
+        )
+
+    def keep_tail(self) -> None:
+        """Finalize every call: this layer's output is captured as is."""
+        if self.tail_fold:
+            moe_tail_fold.keep_finalize(self.experts)
+            self.tail_fold = False
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight.to(torch.float32))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor | MoEOutput:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.
         router_logits, _ = self.gate(hidden_states)
+        if self.tail_fold and self.experts.moe_config.should_defer_moe_finalize(
+            num_tokens
+        ):
+            # The experts stop after GEMM2 (the custom op returns tensors
+            # only, so call the runner directly); the next RMSNorm finalizes.
+            shared_output, routed = self.experts._forward_impl(
+                hidden_states, router_logits, hidden_states
+            )
+            return MoEOutput(routed=routed, shared_output=shared_output)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -338,6 +373,7 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        _fuse_small_m_mxfp8(self.qkv_proj, self.o_proj)
 
         # Per-head QK norm (qk_norm_type == "per_head", use_gemma_norm == True).
         self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -367,24 +403,31 @@ class MiniMaxM3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        project: bool = True,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        # Fused per-head Gemma QK-norm + partial NeoX RoPE on q/k, in place.
-
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
-            qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            self.rotary_emb.cos_sin_cache,
-            positions,
-            self.num_heads,
-            self.num_kv_heads,
-            self.rotary_emb.rotary_dim,
-            self.q_norm.variance_epsilon,
-            kv_cache_dtype="auto",
-        )
+        """``project=False`` returns the attention output before o_proj."""
+        if qkv_epilogue_prep.applies(self, hidden_states, positions, sparse=False):
+            # Norms and RoPE in the qkv_proj epilogue (qkv_epilogue_prep.py).
+            qkv = qkv_epilogue_prep.dense_qkv_prep(self, hidden_states, positions)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            # Fused per-head Gemma QK-norm + partial NeoX RoPE on q/k, in place.
+            ops.fused_minimax_m3_qknorm_rope_kv_insert(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+                kv_cache_dtype="auto",
+            )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v)
+        if not project:
+            return attn_output
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -439,7 +482,24 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
         self.num_idx_heads = self.num_kv_heads
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
-        self.index_q_size = self.num_idx_heads * self.idx_head_dim
+        vllm_config = get_current_vllm_config()
+        # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
+        # cache (--attention-config '{"indexer_kv_dtype": ...}').
+        self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
+            "bf16"
+        )
+        # TP-sharded index-K cache (nvidia/idxk_shard.py): every rank then
+        # computes (and scores) all index_q heads; the top-k stays per rank.
+        self.index_k_shard = idxk_shard.resolve_shard(
+            vllm_config,
+            self.total_idx_heads,
+            self.indexer_kv_dtype,
+            sparse_cfg["sparse_topk_blocks"],
+        )
+        self.num_qkv_idx_heads = (
+            self.total_idx_heads if self.index_k_shard > 1 else self.num_idx_heads
+        )
+        self.index_q_size = self.num_qkv_idx_heads * self.idx_head_dim
 
         # Single fused projection: q, k, v, index_q, index_k in one GEMM.
         self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
@@ -452,6 +512,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            replicate_index_q=self.index_k_shard > 1,
         )
         # reduce_results=False: the attention all-reduce is fused with the
         # following post_attention_layernorm (GemmaRMSNorm) in the decoder layer
@@ -464,6 +525,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        _fuse_small_m_mxfp8(self.qkv_proj, self.o_proj)
 
         # Per-head QK norm (qk_norm_type == "per_head", use_gemma_norm == True).
         self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -488,7 +550,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.index_rotary_emb = self.rotary_emb
 
         # Attention-backend wiring.
-        vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
@@ -500,11 +561,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # of wrapping the generic Attention module. Keep the same runtime scale
         # attributes so FP8 KV reads can honor vLLM's per-layer descale contract.
         set_default_quant_scales(self, register_buffer=True)
-        # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
-        # cache (--attention-config '{"indexer_kv_dtype": ...}').
-        self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
-            "bf16"
-        )
 
         # Shared top-k buffer: the indexer writes the selected blocks into it and
         # the attend impl reads them back (so nothing crosses the eager break as a
@@ -545,6 +601,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             cache_config=cache_config,
             indexer_kv_dtype=self.indexer_kv_dtype,
             topk_indices_buffer=topk_indices_buffer,
+            index_k_shard=self.index_k_shard,
         )
 
         # Register the main K/V cache so the KV-cache manager allocates it.
@@ -581,7 +638,27 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        project: bool = True,
     ) -> torch.Tensor:
+        """``project=False`` returns the attention output before o_proj."""
+        fwd_slot_mapping = get_forward_context().slot_mapping
+        if (
+            isinstance(fwd_slot_mapping, dict)
+            and self.layer_name in fwd_slot_mapping
+            and qkv_epilogue_prep.applies(self, hidden_states, positions, sparse=True)
+        ):
+            # Norms, RoPE and cache inserts in the qkv_proj epilogue
+            # (qkv_epilogue_prep.py).
+            q, query_fp8, index_q = self._qkv_epilogue_prep(
+                positions, hidden_states, fwd_slot_mapping
+            )
+            output = torch.empty_like(q)
+            attn_output = self._run_attention(q, query_fp8, index_q, output)
+            if not project:
+                return attn_output
+            output, _ = self.o_proj(attn_output)
+            return output
+
         # Single fused projection emitting [q | k | v | index_q | index_k].
         qkv, _ = self.qkv_proj(hidden_states)
 
@@ -606,17 +683,24 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             or self.layer_name not in fwd_slot_mapping
         ):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
-            return qkv.new_zeros((num_tokens, self.hidden_size))
+            return qkv.new_zeros(
+                (num_tokens, self.hidden_size if project else self.q_size)
+            )
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
-        index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
+        index_cache = self.indexer.index_cache
+        index_slot_mapping = fwd_slot_mapping[index_cache.prefix]
         q = qkv.new_empty((num_tokens, self.q_size))
         query_fp8 = self._allocate_query_fp8(qkv)
+        if index_cache.tp_shard > 1:
+            # Sharded index-K: insert only this rank's rows.
+            index_md = get_forward_context().attn_metadata[index_cache.prefix]
+            index_slot_mapping = index_md.index_slot_mapping
         # index_q matches the index-K cache dtype (e4m3 for the fp8 score path);
         # the fused kernel emits fp8 directly when this buffer is e4m3.
         index_q = qkv.new_empty(
             (num_tokens, self.index_q_size),
-            dtype=self.indexer.index_cache.dtype,
+            dtype=index_cache.dtype,
         )
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
@@ -630,11 +714,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             eps,
             self.index_q_norm.weight,
             self.index_k_norm.weight,
-            self.num_idx_heads,
+            self.num_qkv_idx_heads,
             main_slot_mapping,
             index_slot_mapping,
             self.kv_cache,
-            self.indexer.index_cache.kv_cache,
+            index_cache.kv_cache,
             self.kv_cache.size(2),  # paged-cache block size
             q,
             index_q,
@@ -645,8 +729,41 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         output = torch.empty_like(q)
         attn_output = self._run_attention(q, query_fp8, index_q, output)
+        if not project:
+            return attn_output
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _qkv_epilogue_prep(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        fwd_slot_mapping: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """``forward``'s qkv_proj + fused qknorm/rope/insert as one GEMM;
+        returns its ``q``, ``query_fp8`` and ``index_q``."""
+        num_tokens = hidden_states.shape[0]
+        index_cache = self.indexer.index_cache
+        index_slot_mapping = fwd_slot_mapping[index_cache.prefix]
+        if index_cache.tp_shard > 1:
+            index_md = get_forward_context().attn_metadata[index_cache.prefix]
+            index_slot_mapping = index_md.index_slot_mapping
+        q = hidden_states.new_empty((num_tokens, self.q_size))
+        query_fp8 = self._allocate_query_fp8(hidden_states)
+        index_q = hidden_states.new_empty(
+            (num_tokens, self.index_q_size), dtype=index_cache.dtype
+        )
+        qkv_epilogue_prep.sparse_qkv_prep(
+            self,
+            hidden_states,
+            positions,
+            fwd_slot_mapping[self.layer_name],
+            index_slot_mapping,
+            q,
+            query_fp8,
+            index_q,
+        )
+        return q, query_fp8, index_q
 
     @eager_break_during_capture
     def _run_attention(
@@ -659,14 +776,17 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Single eager break around both: their split-K kernels read per-request
         # metadata and can't be captured into a cudagraph. The indexer writes its
         # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
+        timer_token = mixed_attn_timer.span_start()
         self.indexer(index_query)
-        return self.impl.forward(
+        output = self.impl.forward(
             self,
             query,
             self.kv_cache,
             output,
             query_fp8=query_fp8,
         )
+        mixed_attn_timer.span_end("srun", timer_token)
+        return output
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -698,6 +818,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # fused into this layer's input_layernorm.
         # Configured by MiniMaxM3Model.__init__
         self.fuse_input_allreduce = False
+        # When set, decode-sized captured calls push the o_proj output into
+        # the post-attention all-reduce (oproj_ar_push.py).
+        self.oproj_ar_push = False
 
         is_sparse_attention_layer = (
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
@@ -758,10 +881,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | MoEOutput,
         residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.fuse_input_allreduce and residual is not None:
+    ) -> tuple[torch.Tensor | MoEOutput, torch.Tensor]:
+        if isinstance(hidden_states, MoEOutput):
+            # The previous MoE layer left its tail to this RMSNorm.
+            assert residual is not None
+            hidden_states, residual = moe_tail_fold.finalize_ar_rmsnorm(
+                hidden_states, residual, self.input_layernorm
+            )
+        elif self.fuse_input_allreduce and residual is not None:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
@@ -771,14 +900,28 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
-
-        hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
-        )
+        if self.oproj_ar_push and oproj_ar_push.applies(
+            self.self_attn.o_proj, hidden_states.shape[0]
+        ):
+            attn_output = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                project=False,
+            )
+            hidden_states, residual = oproj_ar_push.o_proj_ar_rmsnorm(
+                self.self_attn.o_proj,
+                attn_output,
+                residual,
+                self.post_attention_layernorm,
+            )
+        else:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
         return hidden_states, residual
@@ -864,6 +1007,42 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
+        # Collective: every rank builds the folded MoE tail's workspace here.
+        if any(moe.tail_fold for moe in self._moe_blocks()):
+            moe_tail_fold.init_workspace(
+                config.hidden_size, config.num_experts_per_tok, config.rms_norm_eps
+            )
+        # Collective as well: the o_proj push's mailbox and warm-up launches.
+        decoder_layers = self.layers[self.start_layer : self.end_layer]
+        if (
+            oproj_ar_push.ENABLED
+            and get_pp_group().world_size == 1
+            and decoder_layers
+            and oproj_ar_push.init_workspace(
+                config.hidden_size,
+                decoder_layers[0].self_attn.o_proj.input_size_per_partition,
+                config.rms_norm_eps,
+            )
+        ):
+            for layer in decoder_layers:
+                layer.oproj_ar_push = True
+
+    def _moe_blocks(self) -> list[MiniMaxM3MoE]:
+        return [
+            layer.block_sparse_moe
+            for layer in self.layers[self.start_layer : self.end_layer]
+            if getattr(layer, "is_moe_layer", False)
+        ]
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        # EAGLE3 captures hidden_states + residual after these layers, so their
+        # MoE output must stay finalized.
+        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+            if (idx + 1) in self.aux_hidden_state_layers and getattr(
+                layer, "is_moe_layer", False
+            ):
+                layer.block_sparse_moe.keep_tail()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -899,7 +1078,11 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        if self.fuse_final_norm_allreduce:
+        if isinstance(hidden_states, MoEOutput):
+            hidden_states, _ = moe_tail_fold.finalize_ar_rmsnorm(
+                hidden_states, residual, self.norm
+            )
+        elif self.fuse_final_norm_allreduce:
             hidden_states, _ = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.norm
             )
