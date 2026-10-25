@@ -6,15 +6,19 @@ import torch.nn.functional as F
 
 import vllm._custom_ops as ops
 from tests.kernels.utils import opcheck
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_e4m3_quantize,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
+    kMxfp8Dynamic,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -101,6 +105,14 @@ class MockLinearFp8Dynamic128(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self._input_quant_key = kFp8Dynamic128Sym
+
+
+class MockLinearMxfp8Dynamic(torch.nn.Module):
+    """Mock linear layer advertising kMxfp8Dynamic (F8_128x4 scales)."""
+
+    def __init__(self):
+        super().__init__()
+        self._input_quant_key = kMxfp8Dynamic
 
 
 class MockLinearNoQuant(torch.nn.Module):
@@ -244,3 +256,49 @@ def test_maybe_fused_act_quant_preserves_required_unquantized_input(
 
     assert isinstance(result, torch.Tensor)
     torch.testing.assert_close(result, act_fn(x))
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() and current_platform.has_device_capability(100)),
+    reason="MXFP8 activation quantization requires SM100+",
+)
+@pytest.mark.parametrize("token_shape", [(1,), (4,), (129,), (2, 17)])
+@pytest.mark.parametrize("hidden_size", [96, 1536])
+@pytest.mark.parametrize("limit, alpha, beta", [(7.0, 1.702, 1.0), (10.0, 1.0, 0.0)])
+@torch.inference_mode()
+def test_maybe_fused_act_quant_clamp_mxfp8(
+    default_vllm_config,
+    token_shape: tuple[int, ...],
+    hidden_size: int,
+    limit: float,
+    alpha: float,
+    beta: float,
+) -> None:
+    """The fused SiluAndMulWithClamp + MXFP8 producer is bitwise the unfused
+    pair, including the zeroed scale padding of the F8_128x4 layout."""
+    act_fn = SiluAndMulWithClamp(limit, alpha, beta)
+    x = torch.randn(
+        *token_shape, hidden_size * 2, dtype=torch.bfloat16, device="cuda:0"
+    )
+    x *= 6
+    flat = x.view(-1, hidden_size * 2)
+    flat[0, :4] = torch.tensor([0.0, -0.0, float("inf"), -float("inf")])
+    flat[-1, : hidden_size // 2] = 1e4
+
+    result = maybe_fused_act_quant(act_fn, x, MockLinearMxfp8Dynamic())
+
+    assert isinstance(result, QuantizedActivation)
+    assert result.quant_key == kMxfp8Dynamic
+    assert result.orig_shape == (*token_shape, hidden_size)
+    ref_q, ref_scale = mxfp8_e4m3_quantize(
+        act_fn.forward_cuda(flat), is_sf_swizzled_layout=True
+    )
+    torch.testing.assert_close(
+        result.data.reshape(-1, hidden_size).view(torch.uint8),
+        ref_q.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        result.scale.view(torch.uint8), ref_scale.view(torch.uint8), rtol=0, atol=0
+    )

@@ -17,7 +17,11 @@ from collections.abc import Callable
 
 import torch
 
-from vllm.model_executor.layers.activation import ReLUSquaredActivation, SiluAndMul
+from vllm.model_executor.layers.activation import (
+    ReLUSquaredActivation,
+    SiluAndMul,
+    SiluAndMulWithClamp,
+)
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     get_input_quant_key,
@@ -25,11 +29,16 @@ from vllm.model_executor.layers.fusion.quant_activation import (
 from vllm.model_executor.layers.fusion.relu2_fp8_quant import (
     relu_squared_static_fp8_quant,
 )
+from vllm.model_executor.layers.fusion.silu_and_mul_with_clamp_mxfp8_quant import (
+    silu_and_mul_with_clamp_mxfp8_quant,
+    silu_and_mul_with_clamp_mxfp8_supported,
+)
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
+    kMxfp8Dynamic,
     kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
@@ -40,7 +49,7 @@ FP4_DTYPE = torch.uint8
 
 
 def _silu_and_mul_fp8_static(
-    x: torch.Tensor, linear: LinearBase
+    act_fn: torch.nn.Module, x: torch.Tensor, linear: LinearBase
 ) -> QuantizedActivation:
     """SiluAndMul + FP8 static per-tensor quantization."""
     d = x.shape[-1] // 2
@@ -92,14 +101,14 @@ def _silu_and_mul_fp8_dynamic_block(
 
 
 def _silu_and_mul_fp8_dynamic_128(
-    x: torch.Tensor, linear: LinearBase
+    act_fn: torch.nn.Module, x: torch.Tensor, linear: LinearBase
 ) -> QuantizedActivation:
     """SiluAndMul + FP8 dynamic per-group (group=128) quantization."""
     return _silu_and_mul_fp8_dynamic_block(x, linear, 128, kFp8Dynamic128Sym)
 
 
 def _silu_and_mul_nvfp4_dynamic(
-    x: torch.Tensor, linear: LinearBase
+    act_fn: torch.nn.Module, x: torch.Tensor, linear: LinearBase
 ) -> QuantizedActivation:
     """SiluAndMul + NVFP4 dynamic quantization."""
     assert x.ndim in (2, 3), f"Input must be 2D or 3D, got {x.shape}"
@@ -144,8 +153,9 @@ def _silu_and_mul_nvfp4_dynamic(
     )
 
 
-# (activation module type, consumer input quantization key) -> fused producer.
-# Add a row for each supported manual producer.
+# (activation module type, consumer input quantization key) -> fused producer,
+# called as producer(act_fn, x, linear). Add a row for each supported manual
+# producer.
 _FUSED_ACT_QUANT: dict[tuple[type, QuantKey], Callable] = {
     (SiluAndMul, kFp8StaticTensorSym): _silu_and_mul_fp8_static,
 }
@@ -188,6 +198,13 @@ if current_platform.is_cuda() and current_platform.has_device_capability(90):
 if current_platform.is_cuda_alike():
     _FUSED_ACT_QUANT[(SiluAndMul, kFp8Dynamic128Sym)] = _silu_and_mul_fp8_dynamic_128
 
+# SiluAndMulWithClamp + MXFP8 for the FlashInfer MXFP8 linears (SM100+), whose
+# activation scales use the F8_128x4 layout.
+if current_platform.is_cuda() and current_platform.has_device_capability(100):
+    _CLAMP_MXFP8_KEY = (SiluAndMulWithClamp, kMxfp8Dynamic)
+    _FUSED_ACT_QUANT[_CLAMP_MXFP8_KEY] = silu_and_mul_with_clamp_mxfp8_quant
+    _FUSED_ACT_QUANT_SUPPORT[_CLAMP_MXFP8_KEY] = silu_and_mul_with_clamp_mxfp8_supported
+
 # Add NVFP4 if supported (requires SM100+)
 if current_platform.is_cuda() and hasattr(torch.ops._C, "silu_and_mul_nvfp4_quant"):
     _FUSED_ACT_QUANT[(SiluAndMul, kNvfp4Dynamic)] = _silu_and_mul_nvfp4_dynamic
@@ -209,5 +226,5 @@ def maybe_fused_act_quant(
         producer = _FUSED_ACT_QUANT.get(registry_key)
         support = _FUSED_ACT_QUANT_SUPPORT.get(registry_key)
         if producer is not None and (support is None or support(act_fn, x, linear)):
-            return producer(x, linear)
+            return producer(act_fn, x, linear)
     return act_fn(x)

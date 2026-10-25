@@ -41,7 +41,7 @@ def _relu_squared_static_fp8_quant_kernel(
 
 
 def relu_squared_static_fp8_quant(
-    x: torch.Tensor, linear: LinearBase
+    act_fn: torch.nn.Module, x: torch.Tensor, linear: LinearBase
 ) -> QuantizedActivation:
     """BF16 ReLU2 followed by static per-tensor FP8 quantization."""
     assert x.dtype == torch.bfloat16
