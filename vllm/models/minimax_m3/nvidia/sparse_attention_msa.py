@@ -55,16 +55,6 @@ def _get_msa_cutlass_min_batch_size() -> int | None:
     return int(value) if value is not None else None
 
 
-def _dequantize_query(
-    query_fp8: torch.Tensor, q_scale: float, out: torch.Tensor
-) -> torch.Tensor:
-    """Write ``query_fp8 * q_scale`` into ``out`` (E4M3 is exact in BF16)."""
-    out.copy_(query_fp8)
-    if q_scale != 1.0:
-        out.mul_(q_scale)
-    return out
-
-
 class MiniMaxM3SparseMSABackend(MiniMaxM3SparseBackend):
     """MiniMax M3 backend with NVIDIA MSA-specific decode metadata."""
 
@@ -274,8 +264,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
         # Given query_fp8, it is the only q the fused insert wrote: CUTLASS
-        # decode and prefill read it directly, and Triton decode reads it
-        # dequantized into ``query``.
+        # and Triton decode and prefill read it directly.
         q_fp8 = (
             None
             if query_fp8 is None
@@ -319,9 +308,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                 )
             else:
                 minimax_m3_sparse_attn_decode(
-                    q[:nd]
-                    if q_fp8 is None
-                    else _dequantize_query(q_fp8[:nd], q_scale_float, q[:nd]),
+                    q[:nd] if q_fp8 is None else q_fp8[:nd],
                     kv_cache,
                     topk[:nd].transpose(0, 1),
                     d.block_table,
@@ -332,6 +319,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                     d.decode_query_len,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    q_scale=q_scale_float,
                 )
 
         # Prefill [nd:]: MSA sparse FMHA over the selected blocks.

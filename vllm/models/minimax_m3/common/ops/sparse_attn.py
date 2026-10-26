@@ -253,6 +253,7 @@ def _gqa_sparse_decode_kernel(
     head_dim,
     max_topk,
     sm_scale,
+    q_scale,
     decode_query_len,
     stride_qn,
     stride_qh,
@@ -281,6 +282,8 @@ def _gqa_sparse_decode_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
+    Q_FP8: tl.constexpr,  # fp8 query: dequantize to bf16 (times q_scale) on load
+    LOOP_STAGES: tl.constexpr,  # None: the launch's num_stages
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
     USE_PDL: tl.constexpr,
 ):
@@ -330,9 +333,11 @@ def _gqa_sparse_decode_kernel(
         mask=hd_mask,
         other=0.0,
     )
+    if Q_FP8:
+        q = (q.to(tl.float32) * q_scale).to(tl.bfloat16)
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
-    for _ in tl.range(chunk_start_topk, chunk_end_topk):
+    for _ in tl.range(chunk_start_topk, chunk_end_topk, num_stages=LOOP_STAGES):
         blk = tl.load(cur_idx_ptr).to(tl.int32)
         cur_idx_ptr = cur_idx_ptr + stride_tk
         # topk_idx uses -1 for unused entries. Select a safe logical block
@@ -626,8 +631,13 @@ def minimax_m3_sparse_attn_decode(
     decode_query_len: int,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    q_scale: float = 1.0,
 ) -> None:
-    """GQA block-sparse attention for decode (split-K over the top-k blocks)."""
+    """GQA block-sparse attention for decode (split-K over the top-k blocks).
+
+    An fp8 ``q`` is dequantized in the kernel to bf16 ``q * q_scale``, which is
+    what dequantizing it into a bf16 tensor first would give.
+    """
     total_q, num_heads, head_dim = q.shape
     assert total_q == seq_lens.shape[0] * decode_query_len
     max_topk = topk_idx.shape[-1]
@@ -664,8 +674,15 @@ def minimax_m3_sparse_attn_decode(
     TARGET_GRID = 256
     target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
     num_topk_chunks = 1 << (target.bit_length() - 1)
+    q_fp8 = q.dtype in _FP8_DTYPES
+    assert not q_fp8 or output.dtype == torch.bfloat16
     o_partial = torch.empty(
-        num_topk_chunks, total_q, num_heads, head_dim, dtype=q.dtype, device=q.device
+        num_topk_chunks,
+        total_q,
+        num_heads,
+        head_dim,
+        dtype=output.dtype if q_fp8 else q.dtype,
+        device=q.device,
     )
     lse_partial = torch.empty(
         num_topk_chunks, total_q, num_heads, dtype=torch.float32, device=q.device
@@ -686,6 +703,7 @@ def minimax_m3_sparse_attn_decode(
         head_dim,
         max_topk,
         sm_scale,
+        q_scale,
         decode_query_len,
         q.stride(0),
         q.stride(1),
@@ -712,6 +730,10 @@ def minimax_m3_sparse_attn_decode(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_FP8=use_fp8,
+        Q_FP8=q_fp8,
+        # With an fp8 q, pipelining a short block loop (<= 4 blocks per program)
+        # costs up to 25% on GB300; longer loops still gain from it.
+        LOOP_STAGES=1 if q_fp8 and num_topk_chunks >= 4 else None,
         KV_SCALE_MODE=kv_scale_mode,
         USE_PDL=use_pdl,
         **pdl_launch,

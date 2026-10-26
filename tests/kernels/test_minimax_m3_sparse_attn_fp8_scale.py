@@ -187,3 +187,54 @@ def test_minimax_m3_sparse_decode_fp8_kv_scales(scale_mode: str):
 
     torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
     assert not torch.allclose(unscaled, ref, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.skipif(
+    current_platform.is_rocm(), reason="The fp8 query path is in the CUDA decode."
+)
+@pytest.mark.parametrize("q_scale", [1.0, 0.75])
+@torch.inference_mode()
+def test_minimax_m3_sparse_decode_fp8_query(q_scale: float):
+    """Decoding an fp8 query in the kernel is bitwise the bf16 dequant first."""
+    decode_query_len = 4
+    num_reqs = 3
+    num_blocks = 4
+    total_q = num_reqs * decode_query_len
+    torch.manual_seed(4)
+    q_fp8 = (
+        torch.randn(total_q, NUM_HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) * 4
+    ).to(current_platform.fp8_dtype())
+    q_bf16 = q_fp8.to(DTYPE)
+    if q_scale != 1.0:
+        q_bf16.mul_(q_scale)
+    kv_fp8, _ = _make_kv_cache(num_reqs * num_blocks, seed=5)
+    k_scale, v_scale = _scale_tensors("scalar", num_reqs * num_blocks)
+    topk = (
+        torch.arange(num_blocks, dtype=torch.int32, device=DEVICE)
+        .repeat(NUM_KV_HEADS, total_q, 1)
+        .contiguous()
+    )
+    block_table = torch.arange(
+        num_reqs * num_blocks, dtype=torch.int32, device=DEVICE
+    ).view(num_reqs, num_blocks)
+    seq_lens = torch.tensor([200, 333, 512], dtype=torch.int32, device=DEVICE)
+    got = torch.empty_like(q_bf16)
+    ref = torch.empty_like(q_bf16)
+
+    for q, out, scale in ((q_fp8, got, q_scale), (q_bf16, ref, 1.0)):
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv_fp8,
+            topk,
+            block_table,
+            seq_lens,
+            NUM_KV_HEADS,
+            HEAD_DIM**-0.5,
+            out,
+            decode_query_len=decode_query_len,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            q_scale=scale,
+        )
+
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
