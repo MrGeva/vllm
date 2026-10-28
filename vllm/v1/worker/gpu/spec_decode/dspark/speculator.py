@@ -32,6 +32,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.tp_markov import TPMarkovSampler
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
@@ -80,6 +81,8 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
+        # Vocab-parallel Markov loop; set in load_model when enabled.
+        self._tp_markov_sampler: TPMarkovSampler | None = None
 
     def load_draft_model(
         self,
@@ -112,6 +115,25 @@ class DSparkSpeculator(DFlashSpeculator):
             # is available.
             self.use_acceptance_estimator = False
         return model
+
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        super().load_model(target_model)
+        if not self.speculative_config.dspark_tp_markov_sampling:
+            return
+        # Every TP rank reaches the same decision (the checks follow from the
+        # config or are agreed collectively): the sampler's setup is collective.
+        reason = TPMarkovSampler.unsupported_reason(self)
+        if reason is None:
+            reason = TPMarkovSampler.inexact_projection_reason(self)
+        if reason is not None:
+            logger.warning(
+                "dspark_tp_markov_sampling is ignored because %s; the Markov "
+                "loop runs replicated on every TP rank.",
+                reason,
+            )
+            return
+        self._tp_markov_sampler = TPMarkovSampler(self)
+        logger.info("DSpark Markov sampling is vocab-parallel over TP.")
 
     def supports_batch_sharded_draft_logits(self) -> bool:
         # A model's own sample_sequential kernels write the full-size cache.
@@ -191,6 +213,14 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        if (
+            self._tp_markov_sampler is not None
+            and num_reqs <= self._tp_markov_sampler.max_reqs
+        ):
+            self._tp_markov_sampler.sample(
+                self, num_reqs, base_logits, idx_map, sample_pos
+            )
+            return
         confidence_markov_embeds = []
 
         # Anchor (bonus) token per request = the input id at query offset 0,

@@ -671,6 +671,15 @@ class SpeculativeConfig:
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
+    dspark_tp_markov_sampling: bool = False
+    """For DSpark drafting with tensor parallelism, run the sequential Markov
+    sampling loop vocab-parallel: each TP rank computes the Markov bias and the
+    Gumbel sample for its share of the vocabulary, and the ranks exchange
+    per-block maxima over symmetric memory. The drafted tokens and cached
+    draft logits are the same as the replicated loop's. Needs CUDA symmetric
+    memory and probabilistic drafting over the full vocabulary; otherwise the
+    replicated loop runs."""
+
     xpress_topc: int | None = Field(default=None, ge=0)
     """For XPress drafting, score each Jacobi pass only on the drafter's top-C
     base-logit candidates. 0 disables the narrowing and scores the full
@@ -1722,6 +1731,10 @@ class SpeculativeConfig:
 
                 if self.dspark_draft_topk is not None and self.method != "dspark":
                     raise ValueError("dspark_draft_topk is only supported by DSpark")
+                if self.dspark_tp_markov_sampling and self.method != "dspark":
+                    raise ValueError(
+                        "dspark_tp_markov_sampling is only supported by DSpark"
+                    )
 
                 dspark_draft_topk = None
                 if self.method == "dspark":
