@@ -152,12 +152,15 @@ logger = init_logger(__name__)
 
 # Largest batch whose MoE top-k finalize runs inside the next layer's fused
 # all-reduce + input norm + MXFP8 quantization. Larger batches finalize in the
-# MoE and use the regular fused all-reduce + norm. The fused kernel is a
-# one-shot multicast all-reduce, so its traffic grows with the batch: on GB300
-# at TP4 it beats the regular tail (finalize, shared add, two-shot all-reduce +
-# norm, MXFP8 quantization) through 128 tokens, ties at 256 and loses at 512.
-# 128 covers the decode steps of up to 16 requests with 7 speculative tokens.
-FUSED_MOE_FINALIZE_MAX_TOKENS = 128
+# MoE and use the regular fused all-reduce + norm. 512 covers the decode steps
+# of up to 64 requests with 7 speculative tokens.
+FUSED_MOE_FINALIZE_MAX_TOKENS = 512
+# Up to this many tokens the fused kernel all-reduces one-shot (every rank
+# multicasts its rows and reduces all of them); above it, two-shot (each token
+# is reduced by one rank, which multicasts the sum). One-shot traffic grows
+# with the batch: in decode on GB300 at TP4, two-shot is faster from 128
+# tokens.
+FUSED_MOE_FINALIZE_ONE_SHOT_MAX_TOKENS = 64
 
 _QKV_FUSED_EPILOGUE_MIN_TOKENS = 512
 
@@ -1369,6 +1372,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             max_num_tokens=FUSED_MOE_FINALIZE_MAX_TOKENS,
             top_k=self.config.num_experts_per_tok,
             fp32_weights=experts_cls is TrtLlmNvFp4ExpertsModular,
+            one_shot_max_tokens=FUSED_MOE_FINALIZE_ONE_SHOT_MAX_TOKENS,
         )
         logger.info_once(
             "MiniMax M3: MoE top-k finalize fused into the next all-reduce + "
