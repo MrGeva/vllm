@@ -636,6 +636,7 @@ class SpeculativeConfig:
     usage."""
 
     dspark_draft_topk: int | None = Field(default=None, ge=1)
+    dspark_tp_markov_sampling: bool = False
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 

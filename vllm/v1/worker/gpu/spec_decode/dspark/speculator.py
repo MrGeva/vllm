@@ -37,6 +37,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.batch_shard import DraftBatchSharder
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.tp_markov import TPMarkovSampler
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
@@ -89,6 +90,7 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
+        self._tp_markov_sampler = None
         # Set by enable_batch_sharded_sampling().
         self._draft_sharder: DraftBatchSharder | None = None
 
@@ -123,6 +125,19 @@ class DSparkSpeculator(DFlashSpeculator):
             # is available.
             self.use_acceptance_estimator = False
         return model
+
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        super().load_model(target_model)
+        if not getattr(self.speculative_config, "dspark_tp_markov_sampling", False):
+            return
+        reason = TPMarkovSampler.unsupported_reason(self)
+        if reason is None:
+            reason = TPMarkovSampler.inexact_projection_reason(self)
+        if reason is not None:
+            logger.warning("dspark_tp_markov_sampling is ignored because %s", reason)
+            return
+        self._tp_markov_sampler = TPMarkovSampler(self)
+        logger.info("DSpark Markov sampling is vocab-parallel over TP.")
 
     def enable_batch_sharded_sampling(self) -> None:
         # The target verifies each request on its owner rank, so each rank
@@ -250,6 +265,12 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        if (self._tp_markov_sampler is not None and self._draft_sharder is None
+                and num_reqs <= self._tp_markov_sampler.max_reqs):
+            self._tp_markov_sampler.sample(
+                self, num_reqs, base_logits, idx_map, sample_pos
+            )
+            return
         # Step-major, so every step reads contiguous rows. Draws are keyed by
         # the position before the sampled token, P-1.
         idx_map_steps = idx_map.t().contiguous()
