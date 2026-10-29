@@ -261,6 +261,7 @@ class RejectionSampler:
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
         verify_draft_sampled: torch.Tensor,
+        logits_writable: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         processed_logits = self.sampler.apply_sampling_params(
             logits,
@@ -271,6 +272,7 @@ class RejectionSampler:
             draft_sampled,
             expanded_local_pos,
             seq_lens_upper_bound_np,
+            logits_writable=logits_writable,
         )
         sampled, num_sampled = rejection_sample(
             processed_logits,
@@ -310,6 +312,7 @@ class RejectionSampler:
         max_chunk_logits: int,
         max_num_logprobs: int,
         verify_draft_sampled: torch.Tensor | None = None,
+        logits_writable: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -320,6 +323,11 @@ class RejectionSampler:
             verify_draft_sampled = draft_sampled
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+        # Verification may process the logits in place unless the raw logits
+        # feed the returned logprobs.
+        logits_writable = logits_writable and (
+            max_num_logprobs == NO_LOGPROBS or use_processed_logits
+        )
         num_reqs = input_batch.num_reqs
 
         if logits.shape[0] <= max_chunk_logits:
@@ -362,6 +370,7 @@ class RejectionSampler:
                 input_batch.expanded_local_pos[lo:hi],
                 input_batch.seq_lens_cpu_upper_bound.numpy()[start:end],
                 verify_draft_sampled[lo:hi],
+                logits_writable=logits_writable,
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
@@ -424,7 +433,10 @@ class RejectionSampler:
         input_batch: InputBatch,
         draft_logits: DraftLogitsCache | None = None,
         invalid_drafts: torch.Tensor | None = None,
+        logits_writable: bool = False,
     ) -> SamplerOutput:
+        """``logits_writable``: ``logits`` is this step's scratch tensor, which
+        verification may modify in place."""
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
@@ -475,6 +487,7 @@ class RejectionSampler:
             chunk_logit_limit,
             max_num_logprobs,
             verify_draft_sampled,
+            logits_writable=logits_writable,
         )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
