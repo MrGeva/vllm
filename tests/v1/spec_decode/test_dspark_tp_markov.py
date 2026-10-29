@@ -177,6 +177,39 @@ def _worker(local_rank, world_size, port, vocab, q):
             del graph
         assert sampler.errors.item() == 0
 
+        # Owned-columns mode (vocab-sharded verification): each rank samples
+        # from its owned columns' logits only and caches only those; the cache
+        # completion then restores the replicated loop's cache.
+        from vllm.v1.worker.gpu.spec_decode.vocab_shard import vocab_shard_range
+
+        ranges = [vocab_shard_range(vocab, world_size, r) for r in range(world_size)]
+        c0, c1 = ranges[local_rank]
+        assert TPMarkovSampler.inexact_projection_reason(spc, ranges) is None
+        owned = TPMarkovSampler(spc, ranges)
+        for num_reqs in (1, 5, MAX_REQS):
+            base_logits, idx_map, sample_pos = _inputs(spc, num_reqs, vocab, 7, device)
+            spc.draft_logits.values.fill_(-1.0)
+            _replicated_loop(spc, num_reqs, base_logits, idx_map, sample_pos)
+            ref_tokens = spc.draft_tokens[:num_reqs].clone()
+            ref_cache = spc.draft_logits.values.clone()
+            spc.draft_logits.values.fill_(-1.0)
+            owned.sample(
+                spc,
+                num_reqs,
+                base_logits[:, :, c0:c1].contiguous(),
+                idx_map,
+                sample_pos,
+            )
+            torch.accelerator.synchronize()
+            assert torch.equal(spc.draft_tokens[:num_reqs], ref_tokens)
+            assert torch.equal(
+                spc.draft_logits.values[:, :, c0:c1], ref_cache[:, :, c0:c1]
+            )
+            rows = idx_map[:, 0][idx_map[:, 0] >= 0]
+            owned.complete_cache(spc.draft_logits.values, rows)
+            assert torch.equal(spc.draft_logits.values[rows], ref_cache[rows])
+        assert owned.errors.item() == 0
+
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="needs CUDA")
 @pytest.mark.parametrize("world_size", [2, 4])

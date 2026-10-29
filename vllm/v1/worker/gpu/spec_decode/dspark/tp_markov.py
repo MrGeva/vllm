@@ -99,6 +99,9 @@ def _tp_markov_sample_kernel(
     push_max_reqs,
     vocab_size,
     num_blocks,
+    block_start,  # this rank's blocks: [block_start, block_start + num_own)
+    num_own,
+    logits_col0,  # first column held by logits_ptr
     RANK: tl.constexpr,
     WORLD: tl.constexpr,
     PER: tl.constexpr,
@@ -107,14 +110,16 @@ def _tp_markov_sample_kernel(
 ):
     row = tl.program_id(0).to(tl.int64)
     j = tl.program_id(1)
-    block_idx = RANK * PER + j
-    if block_idx >= num_blocks:
+    block_idx = block_start + j
+    if (j >= num_own) | (block_idx >= num_blocks):
         return
     e = tl.load(epoch_ptr).to(tl.int64) + step + 1
     cols = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = cols < vocab_size
     logits = tl.load(
-        logits_ptr + row * logits_stride + cols, mask=mask, other=float("-inf")
+        logits_ptr + row * logits_stride + (cols - logits_col0),
+        mask=mask,
+        other=float("-inf"),
     )
     bias = tl.load(
         bias_ptr + row * bias_stride + j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE),
@@ -322,7 +327,15 @@ def _tp_markov_fill_kernel(
 class TPMarkovSampler:
     """Runs a DSpark speculator's Markov loop vocab-parallel over TP."""
 
-    def __init__(self, speculator: DSparkSpeculator):
+    def __init__(
+        self,
+        speculator: DSparkSpeculator,
+        owned_ranges: list[tuple[int, int]] | None = None,
+    ):
+        """``owned_ranges``: every rank's column range, aligned to blocks
+        (vocab-sharded verification). Each rank then samples its range from
+        logits of those columns only and leaves the other columns of the
+        draft-logits cache unwritten (see `complete_cache`)."""
         import torch.distributed._symmetric_memory as symm_mem
 
         group = get_tp_group()
@@ -334,14 +347,30 @@ class TPMarkovSampler:
         self.vocab_size = min(w2.shape[0], model.logits_processor.org_vocab_size)
         self.w2 = w2[: self.vocab_size]
         self.num_blocks = triton.cdiv(self.vocab_size, _BLOCK_SIZE)
-        self.per = triton.cdiv(self.num_blocks, self.world)
-        self.col_start = min(self.vocab_size, self.rank * self.per * _BLOCK_SIZE)
-        self.col_end = min(self.vocab_size, (self.rank + 1) * self.per * _BLOCK_SIZE)
+        self.owned_only = owned_ranges is not None
+        if owned_ranges is None:
+            self.per = triton.cdiv(self.num_blocks, self.world)
+            owned_ranges = [
+                (
+                    min(self.vocab_size, r * self.per * _BLOCK_SIZE),
+                    min(self.vocab_size, (r + 1) * self.per * _BLOCK_SIZE),
+                )
+                for r in range(self.world)
+            ]
+        else:
+            assert all(a % _BLOCK_SIZE == 0 for a, _ in owned_ranges)
+            self.per = max(triton.cdiv(b - a, _BLOCK_SIZE) for a, b in owned_ranges)
+        self.owned_ranges = owned_ranges
+        self.col_start, self.col_end = owned_ranges[self.rank]
+        self.block_start = self.col_start // _BLOCK_SIZE
+        self.num_own = triton.cdiv(self.col_end - self.col_start, _BLOCK_SIZE)
         # Contiguous rows: F.linear on the slice computes those columns.
         self.w2_shard = w2[self.col_start : self.col_end]
         self.max_reqs = min(speculator.max_num_reqs, _MAX_REQS)
         self.n_spec = speculator.num_speculative_steps
-        self.push_max_reqs = min(_PUSH_MAX_REQS, self.max_reqs)
+        self.push_max_reqs = (
+            0 if self.owned_only else min(_PUSH_MAX_REQS, self.max_reqs)
+        )
         device = w2.device
 
         name = group.device_group.group_name
@@ -350,7 +379,7 @@ class TPMarkovSampler:
         )
         half = _BLOCK_SIZE // 2
         self.stage = symm_mem.empty(
-            2 * self.world * self.push_max_reqs * self.n_spec * self.per * half,
+            max(1, 2 * self.world * self.push_max_reqs * self.n_spec * self.per * half),
             dtype=torch.int64,
             device=device,
         )
@@ -423,7 +452,10 @@ class TPMarkovSampler:
 
     @staticmethod
     @torch.inference_mode()
-    def inexact_projection_reason(speculator: DSparkSpeculator) -> str | None:
+    def inexact_projection_reason(
+        speculator: DSparkSpeculator,
+        owned_ranges: list[tuple[int, int]] | None = None,
+    ) -> str | None:
         """Why this rank's sliced and batched Markov projections would differ
         from the replicated loop's, or None if they match bitwise.
 
@@ -443,6 +475,8 @@ class TPMarkovSampler:
         per = triton.cdiv(num_blocks, group.world_size)
         c0 = min(vocab, group.rank_in_group * per * _BLOCK_SIZE)
         c1 = min(vocab, (group.rank_in_group + 1) * per * _BLOCK_SIZE)
+        if owned_ranges is not None:
+            c0, c1 = owned_ranges[group.rank_in_group]
         n_spec = speculator.num_speculative_steps
         gen = torch.Generator(device=w2.device).manual_seed(0)
         bad = None
@@ -473,7 +507,8 @@ class TPMarkovSampler:
         self,
         speculator: DSparkSpeculator,
         num_reqs: int,
-        base_logits: torch.Tensor,  # [num_reqs, n_spec, vocab]
+        # [num_reqs, n_spec, vocab], or [..., col_end - col_start] (owned only)
+        base_logits: torch.Tensor,
         idx_map: torch.Tensor,  # [num_reqs, n_spec]
         sample_pos: torch.Tensor,  # [num_reqs, n_spec]
     ) -> None:
@@ -481,7 +516,11 @@ class TPMarkovSampler:
         n_spec = self.n_spec
         cache = speculator.draft_logits.values
         assert cache is not None
-        vocab_size = base_logits.shape[-1]
+        vocab_size = self.vocab_size
+        logits_col0 = self.col_start if self.owned_only else 0
+        assert base_logits.shape[-1] == (
+            self.col_end - self.col_start if self.owned_only else vocab_size
+        )
         push = num_reqs <= self.push_max_reqs
         idx_map_steps = idx_map.t().contiguous()
         draw_pos_steps = (sample_pos.t() - 1).contiguous()
@@ -513,6 +552,9 @@ class TPMarkovSampler:
                 self.push_max_reqs,
                 vocab_size,
                 self.num_blocks,
+                self.block_start,
+                self.num_own,
+                logits_col0,
                 RANK=self.rank,
                 WORLD=self.world,
                 PER=self.per,
@@ -537,7 +579,10 @@ class TPMarkovSampler:
             prev = out
 
         rows = idx_map[:, 0]
-        if push:
+        if self.owned_only:
+            # The other columns are filled on demand (complete_cache).
+            pass
+        elif push:
             _tp_markov_unpack_kernel[(num_reqs, n_spec, self.world * self.per)](
                 cache,
                 cache.stride(0),
@@ -584,3 +629,24 @@ class TPMarkovSampler:
                 num_warps=4,
             )
         self.epoch.add_(n_spec)
+
+    def complete_cache(self, cache: torch.Tensor, req_rows: torch.Tensor) -> None:
+        """Owned-only mode: fill the other ranks' columns of the cache rows
+        ``req_rows`` (request state indices), for a consumer that reads the
+        whole vocabulary. An all-gather of every rank's columns."""
+        if not self.owned_only or req_rows.numel() == 0:
+            return
+        group = get_tp_group()
+        rows = req_rows.to(torch.long)
+        width = max(b - a for a, b in self.owned_ranges)
+        mine = cache.new_zeros(rows.numel(), cache.shape[1], width)
+        mine[:, :, : self.col_end - self.col_start] = cache[
+            rows, :, self.col_start : self.col_end
+        ]
+        every = cache.new_empty(self.world, *mine.shape)
+        torch.distributed.all_gather_into_tensor(every, mine, group=group.device_group)
+        full = cache[rows]
+        for r, (a, b) in enumerate(self.owned_ranges):
+            if r != self.rank:
+                full[:, :, a:b] = every[r, :, :, : b - a]
+        cache[rows] = full
