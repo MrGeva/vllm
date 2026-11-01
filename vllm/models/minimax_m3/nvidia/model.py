@@ -148,7 +148,8 @@ FUSED_MOE_FINALIZE_MAX_TOKENS = 512
 # Up to this many tokens at TP4 the fused all-reduce is one-shot (every rank
 # multicasts its rows and reduces all of them); above it, two-shot (each token
 # is reduced by one rank, which multicasts the sum). One-shot traffic grows
-# with the batch, and two-shot was measured faster above it.
+# with the batch. In decode on GB300 at TP4, one-shot was faster at 64 tokens
+# and two-shot at 128; the sizes in between were not measured in serving.
 FUSED_MOE_FINALIZE_ONE_SHOT_MAX_TOKENS = 64
 
 
