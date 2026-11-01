@@ -39,6 +39,11 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.tp_markov import TPMarkovSampler
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+from vllm.v1.worker.gpu.spec_decode.vocab_shard import (
+    VocabShard,
+    vocab_shard_range,
+    vocab_shard_unsupported_reason,
+)
 
 logger = init_logger(__name__)
 
@@ -88,6 +93,9 @@ class DSparkSpeculator(DFlashSpeculator):
         self._draft_topk: int | None = getattr(
             self.draft_model_config.hf_config, "dspark_draft_topk", None
         )
+        # Vocab-sharded drafting (set by enable_vocab_sharded_drafting): the
+        # draft logits of each rank's owned columns only.
+        self._draft_vocab_shard: VocabShard | None = None
 
         self.use_confidence_head: bool = False
         self._tp_markov_sampler = None
@@ -138,6 +146,62 @@ class DSparkSpeculator(DFlashSpeculator):
             return
         self._tp_markov_sampler = TPMarkovSampler(self)
         logger.info("DSpark Markov sampling is vocab-parallel over TP.")
+
+    def enable_vocab_sharded_drafting(self, vocab_shard: VocabShard) -> None:
+        """With vocab-sharded verification, draft on the same owned columns:
+        each rank computes only its columns of the draft logits (its lm_head
+        shard plus its right neighbour's boundary columns), runs the Markov
+        loop on them and caches only them, as verification reads only them.
+        `complete_draft_logits` fills the rest for a step verified in full.
+        Collective: every TP rank calls it."""
+        sampler = self._tp_markov_sampler
+        reason = None
+        if sampler is None:
+            reason = "dspark_tp_markov_sampling is not active"
+        elif not hasattr(self.model, "compute_draft_logits_local"):
+            reason = "the draft model has no compute_draft_logits_local"
+        elif sampler.vocab_size != vocab_shard.vocab_size:
+            reason = "the draft and target vocabularies differ"
+        if reason is None:
+            hidden = torch.zeros(
+                1,
+                self.model.config.hidden_size,
+                dtype=self.draft_logits.dtype,
+                device=self.device,
+            )
+            local = self.model.compute_draft_logits_local(hidden).shape[-1]
+            reason = vocab_shard_unsupported_reason(
+                sampler.vocab_size, local, vocab_shard.world
+            )
+        ranges = [
+            vocab_shard_range(vocab_shard.vocab_size, vocab_shard.world, r)
+            for r in range(vocab_shard.world)
+        ]
+        if reason is None:
+            reason = TPMarkovSampler.inexact_projection_reason(self, ranges)
+        if reason is not None:
+            logger.info("Drafting is not vocab-sharded because %s.", reason)
+            return
+        self._tp_markov_sampler = None
+        self._tp_markov_sampler = TPMarkovSampler(self, ranges)
+        self._draft_vocab_shard = VocabShard(
+            sampler.vocab_size,
+            local,
+            max_num_logits=self.max_num_reqs * self.num_speculative_steps,
+            max_num_reqs=self.max_num_reqs,
+            device=self.device,
+            verify=False,
+        )
+        logger.info("DSpark drafting is vocab-sharded.")
+
+    def complete_draft_logits(self, idx_mapping: torch.Tensor) -> None:
+        """Fill the other ranks' columns of these requests' cached draft
+        logits (vocab-sharded drafting), before a step verified in full."""
+        if self._draft_vocab_shard is not None and self.draft_logits is not None:
+            assert self._tp_markov_sampler is not None
+            self._tp_markov_sampler.complete_cache(
+                self.draft_logits, idx_mapping
+            )
 
     def enable_batch_sharded_sampling(self) -> None:
         # The target verifies each request on its owner rank, so each rank
@@ -258,6 +322,24 @@ class DSparkSpeculator(DFlashSpeculator):
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        if (
+            self._draft_vocab_shard is not None
+            and self._tp_markov_sampler is not None
+            and num_reqs <= self._tp_markov_sampler.max_reqs
+        ):
+            vs = self._draft_vocab_shard
+            local = self.model.compute_draft_logits_local(sample_hidden)
+            vs.begin_step()
+            owned = vs.owned_logits(local, dtype=local.dtype)
+            vs.end_step()
+            self._tp_markov_sampler.sample(
+                self,
+                num_reqs,
+                owned.view(num_reqs, n_spec, -1),
+                self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec),
+                self.sample_pos[:num_sample].view(num_reqs, n_spec),
+            )
+            return
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]

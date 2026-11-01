@@ -1,14 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
+from vllm.v1.spec_decode.fly import compute_fly_entropy
 from vllm.v1.worker.gpu.sample.gumbel import (
     gumbel_block_argmax,
     spec_step_seed,
     tl_rand32,
 )
 from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_block_argmax
+
+
+@triton.jit
+def shard_row(req_idx, NUM_SHARDS: tl.constexpr):
+    return req_idx // NUM_SHARDS
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.vocab_shard import VocabShard
 
 
 @triton.jit
@@ -145,15 +156,25 @@ def _compute_global_logprobs_and_logsumexp(
     draft_local_max_stride,
     draft_local_sumexp_ptr,
     draft_local_sumexp_stride,
+    # [num_logits, 2] or None: the target and (pre-temperature) draft logits of
+    # the scalar ``token`` at each logit row, for vocab-sharded verification,
+    # where the full rows are not available on this rank.
+    token_logits_ptr,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
+    DRAFT_LOGITS_NUM_SHARDS: tl.constexpr,
 ):
-    target_logit = tl.load(
-        target_logits_ptr + logit_idx * target_logits_stride + token,
-        mask=mask,
-        other=float("-inf"),
-    ).to(tl.float32)
+    if token_logits_ptr is not None:
+        target_logit = tl.load(
+            token_logits_ptr + logit_idx * 2, mask=mask, other=float("-inf")
+        )
+    else:
+        target_logit = tl.load(
+            target_logits_ptr + logit_idx * target_logits_stride + token,
+            mask=mask,
+            other=float("-inf"),
+        ).to(tl.float32)
     target_lse = _compute_global_logsumexp(
         target_local_max_ptr,
         target_local_max_stride,
@@ -166,17 +187,28 @@ def _compute_global_logprobs_and_logsumexp(
     target_log_prob = target_logit - target_lse
     if HAS_DRAFT_LOGITS:
         # draft_logits is stored pre-temperature, so apply scale first.
-        draft_logit = (
-            tl.load(
-                draft_logits_ptr
-                + req_state_idx * draft_logits_stride_0
-                + draft_step * draft_logits_stride_1
-                + token,
-                mask=mask,
-                other=float("-inf"),
-            ).to(tl.float32)
-            / temp
-        )
+        if token_logits_ptr is not None:
+            draft_logit = (
+                tl.load(
+                    token_logits_ptr + logit_idx * 2 + 1,
+                    mask=mask,
+                    other=float("-inf"),
+                )
+                / temp
+            )
+        else:
+            draft_logit = (
+                tl.load(
+                    draft_logits_ptr
+                    + shard_row(req_state_idx, DRAFT_LOGITS_NUM_SHARDS)
+                    * draft_logits_stride_0
+                    + draft_step * draft_logits_stride_1
+                    + token,
+                    mask=mask,
+                    other=float("-inf"),
+                ).to(tl.float32)
+                / temp
+            )
         draft_lse = _compute_global_logsumexp(
             draft_local_max_ptr,
             draft_local_max_stride,
@@ -236,20 +268,26 @@ def _compute_local_logits_stats_kernel(
     temp_ptr,
     vocab_size,
     num_logits,
+    # Vocab-sharded verification: the grid covers blocks [block_start, ...),
+    # and target_logits holds columns [target_col_start, ...) only.
+    block_start,
+    target_col_start,
     BLOCK_SIZE: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
+    DRAFT_LOGITS_NUM_SHARDS: tl.constexpr,
 ):
     logit_idx = tl.program_id(0).to(tl.int64)
 
     if _is_bonus_logit(expanded_local_pos_ptr, logit_idx, num_logits):
         # Max/argmax and summed exponentials are not needed.
         return
+    target_logits_ptr -= target_col_start
 
     draft_step_idx = tl.load(expanded_local_pos_ptr + logit_idx)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + logit_idx).to(tl.int64)
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
 
-    block_idx = tl.program_id(1)
+    block_idx = block_start + tl.program_id(1)
     block_offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = block_offsets < vocab_size
 
@@ -296,7 +334,8 @@ def _compute_local_logits_stats_kernel(
             draft_logits = (
                 tl.load(
                     draft_logits_ptr
-                    + req_state_idx * draft_logits_stride_0
+                    + shard_row(req_state_idx, DRAFT_LOGITS_NUM_SHARDS)
+                    * draft_logits_stride_0
                     + draft_step_idx * draft_logits_stride_1
                     + block_offsets,
                     mask=mask,
@@ -342,6 +381,8 @@ def _compute_cumulative_log_p_kernel(
     # [num_logits, num_blocks]
     draft_local_sumexp_ptr,
     draft_local_sumexp_stride,
+    # [num_logits, 2] or None (see _compute_global_logprobs_and_logsumexp)
+    token_logits_ptr,
     # [num_reqs + 1]
     cu_num_logits_ptr,
     # [num_reqs]
@@ -351,6 +392,7 @@ def _compute_cumulative_log_p_kernel(
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
+    DRAFT_LOGITS_NUM_SHARDS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
@@ -389,9 +431,11 @@ def _compute_cumulative_log_p_kernel(
                     draft_local_max_stride,
                     draft_local_sumexp_ptr,
                     draft_local_sumexp_stride,
+                    token_logits_ptr,
                     vocab_num_blocks,
                     PADDED_VOCAB_NUM_BLOCKS,
                     HAS_DRAFT_LOGITS,
+                    DRAFT_LOGITS_NUM_SHARDS,
                 )
             )
             log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
@@ -435,8 +479,12 @@ def _compute_local_residual_mass_kernel(
     vocab_size,
     num_logits,
     vocab_num_blocks,
+    # See _compute_local_logits_stats_kernel.
+    block_start,
+    target_col_start,
     BLOCK_SIZE: tl.constexpr,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
+    DRAFT_LOGITS_NUM_SHARDS: tl.constexpr,
 ):
     logit_idx = tl.program_id(0).to(tl.int64)
     # Adaptive verification can end before num_speculative_steps.
@@ -459,7 +507,7 @@ def _compute_local_residual_mass_kernel(
     if temp == 0.0:
         return
 
-    block_idx = tl.program_id(1)
+    block_idx = block_start + tl.program_id(1)
     block_offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = block_offsets < vocab_size
     target_log_probs, draft_log_probs, _, _ = _compute_global_logprobs_and_logsumexp(
@@ -469,7 +517,7 @@ def _compute_local_residual_mass_kernel(
         req_state_idx,
         draft_step_idx,
         temp,
-        target_logits_ptr,
+        target_logits_ptr - target_col_start,
         target_logits_stride,
         target_local_max_ptr,
         target_local_max_stride,
@@ -482,9 +530,11 @@ def _compute_local_residual_mass_kernel(
         draft_local_max_stride,
         draft_local_sumexp_ptr,
         draft_local_sumexp_stride,
+        None,  # token_logits_ptr
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS,
         True,  # HAS_DRAFT_LOGITS
+        DRAFT_LOGITS_NUM_SHARDS,
     )
 
     # Compute the residual mass: max(p_i * M_b(x|x_{<i}) - M_s(x|x_{<i}), 0)
@@ -550,11 +600,18 @@ def _rejection_kernel(
     # [num_logits, num_blocks]
     local_residual_mass_ptr,
     local_residual_mass_stride,
+    # [num_logits]
+    fly_entropy_ptr,
+    fly_entropy_threshold,
+    # [num_logits, 2] or None (see _compute_global_logprobs_and_logsumexp)
+    token_logits_ptr,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
+    DRAFT_LOGITS_NUM_SHARDS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
     USE_BLOCK_VERIFICATION: tl.constexpr,
+    FLY_WINDOW_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
@@ -566,6 +623,9 @@ def _rejection_kernel(
     is_greedy = temp == 0.0
 
     accepted_length = tl.zeros((), tl.int64)
+    # Freeze the accepted prefix and recovery stats until the window is confirmed.
+    pending_rejection = tl.full((), -1, tl.int64)
+    rejected_argmax = tl.full((), 0, tl.int64)
     target_lse = 0.0
     draft_lse = 0.0
     verifying = True
@@ -576,12 +636,15 @@ def _rejection_kernel(
         is_valid_draft = draft_sampled >= 0
         # Avoid possible OOB ptr access.
         draft_sampled = tl.maximum(0, draft_sampled)
-        if not is_greedy:
+        if not is_greedy and FLY_WINDOW_SIZE == 0:
             # A -1 placeholder ends verification. Greedy is excluded because it
             # stores the target argmax upon first rejection, so it rejects the
             # placeholder via `accepted` instead.
             verifying &= is_valid_draft
         if verifying:
+            target_argmax = tl.full((), 0, tl.int64)
+            can_defer = False
+            accepted = False
             pos = tl.load(pos_ptr + logit_idx)
             step_seed = spec_step_seed(seed, i) if USE_BLOCK_VERIFICATION else seed
             u = tl_rand32(step_seed, pos, includes_zero=False)
@@ -604,12 +667,15 @@ def _rejection_kernel(
                 else:
                     accepted = target_argmax == draft_sampled
                 accepted &= is_valid_draft
-                verifying = accepted
-                accepted_length += accepted
-                tl.store(
-                    sampled_ptr + req_idx * sampled_stride + i,
-                    draft_sampled if accepted else target_argmax,
-                )
+                if FLY_WINDOW_SIZE > 0:
+                    target_logit = tl.load(
+                        target_logits_ptr
+                        + logit_idx * target_logits_stride
+                        + draft_sampled,
+                        mask=is_valid_draft,
+                        other=float("-inf"),
+                    ).to(tl.float32)
+                    can_defer = is_valid_draft and target_logit > float("-inf")
             elif USE_BLOCK_VERIFICATION:
                 # Block verification (Sun et al., 2024): https://arxiv.org/abs/2403.10444
                 prefix_joint_ratio = tl.exp(
@@ -645,10 +711,10 @@ def _rejection_kernel(
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
             else:
                 # Speculative decoding (Leviathan et al., 2023): https://arxiv.org/abs/2211.17192
-                target_logprob, draft_logprob, target_lse, draft_lse = (
+                target_logprob, draft_logprob, step_target_lse, step_draft_lse = (
                     _compute_global_logprobs_and_logsumexp(
                         draft_sampled,
-                        True,  # mask
+                        is_valid_draft,
                         logit_idx,
                         req_state_idx,
                         i,
@@ -666,11 +732,16 @@ def _rejection_kernel(
                         draft_local_max_stride,
                         draft_local_sumexp_ptr,
                         draft_local_sumexp_stride,
+                        token_logits_ptr,
                         vocab_num_blocks,
                         PADDED_VOCAB_NUM_BLOCKS,
                         HAS_DRAFT_LOGITS,
+                        DRAFT_LOGITS_NUM_SHARDS,
                     )
                 )
+                if FLY_WINDOW_SIZE == 0 or pending_rejection < 0:
+                    target_lse = step_target_lse
+                    draft_lse = step_draft_lse
                 if SYNTHETIC_MODE:
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted = u < rate
@@ -678,9 +749,47 @@ def _rejection_kernel(
                     # Probability ratio test: p(x) > u * q(x)
                     # Equivalent log form: log_p(x) > log(u) + log_q(x)
                     accepted = target_logprob > tl.log(u) + draft_logprob
-                verifying = accepted
-                accepted_length += accepted
-                tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
+                if FLY_WINDOW_SIZE > 0:
+                    accepted &= is_valid_draft
+                    can_defer = (
+                        is_valid_draft
+                        and target_logprob > float("-inf")
+                        and draft_logprob > float("-inf")
+                    )
+
+            if not USE_BLOCK_VERIFICATION or is_greedy:
+                if FLY_WINDOW_SIZE > 0:
+                    if pending_rejection >= 0:
+                        # Only native acceptance can confirm a pending window.
+                        verifying = accepted
+                        if accepted and i - pending_rejection == FLY_WINDOW_SIZE:
+                            accepted_length = i + 1
+                            pending_rejection = tl.full((), -1, tl.int64)
+                    elif accepted:
+                        accepted_length = i + 1
+                    else:
+                        rejected_argmax = target_argmax
+                        entropy = tl.load(fly_entropy_ptr + logit_idx)
+                        verifying = (
+                            can_defer
+                            and i + FLY_WINDOW_SIZE < num_draft_tokens
+                            and entropy >= fly_entropy_threshold
+                        )
+                        if verifying:
+                            pending_rejection = i
+                    tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
+                else:
+                    verifying = accepted
+                    accepted_length += accepted
+                    tl.store(
+                        sampled_ptr + req_idx * sampled_stride + i,
+                        target_argmax if is_greedy and not accepted else draft_sampled,
+                    )
+    if FLY_WINDOW_SIZE > 0 and is_greedy and accepted_length < num_draft_tokens:
+        tl.store(
+            sampled_ptr + req_idx * sampled_stride + accepted_length,
+            rejected_argmax,
+        )
 
     tl.store(rejected_steps_ptr + req_idx, accepted_length)
     if USE_BLOCK_VERIFICATION and not is_greedy and accepted_length < num_draft_tokens:
@@ -789,8 +898,12 @@ def _resample_kernel(
     watermark_key_0,
     watermark_key_1,
     vocab_size,
+    # See _compute_local_logits_stats_kernel.
+    block_start,
+    target_col_start,
     BLOCK_SIZE: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
+    DRAFT_LOGITS_NUM_SHARDS: tl.constexpr,
     USE_FP64: tl.constexpr,
     USE_BLOCK_VERIFICATION: tl.constexpr,
     CONTEXT_WIDTH: tl.constexpr,
@@ -818,11 +931,13 @@ def _resample_kernel(
     )
     is_valid_rejected_draft = rejected_draft_token >= 0
 
-    block_idx = tl.program_id(1)
+    block_idx = block_start + tl.program_id(1)
     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = block < vocab_size
     target_logits = tl.load(
-        target_logits_ptr + resample_token_idx * target_logits_stride + block,
+        target_logits_ptr
+        + resample_token_idx * target_logits_stride
+        + (block - target_col_start),
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
@@ -856,7 +971,8 @@ def _resample_kernel(
         draft_logits = (
             tl.load(
                 draft_logits_ptr
-                + req_state_idx * draft_logits_stride_0
+                + shard_row(req_state_idx, DRAFT_LOGITS_NUM_SHARDS)
+                * draft_logits_stride_0
                 + resample_idx * draft_logits_stride_1
                 + block,
                 mask=mask,
@@ -1030,7 +1146,9 @@ def _insert_resampled_kernel(
 def rejection_sample(
     # [num_logits, V]
     target_logits: torch.Tensor,
-    # [max_num_reqs, num_speculative_steps, V]
+    # [max_num_reqs, num_speculative_steps, V], or under batch-sharded
+    # sampling, [cdiv(max_num_reqs, draft_logits_num_shards), ...] holding this
+    # rank's requests at row req_state_idx // draft_logits_num_shards.
     draft_logits: torch.Tensor | None,
     # [num_logits]
     draft_sampled: torch.Tensor,
@@ -1057,13 +1175,29 @@ def rejection_sample(
     watermarking: torch.Tensor | None = None,
     watermarking_skip_mask: torch.Tensor | None = None,
     watermark_key: int | None = None,
+    fly_window_size: int = 0,
+    fly_entropy_threshold: float = 0.3,
+    fly_entropy_top_k: int = 3,
+    draft_logits_num_shards: int = 1,
+    vocab_shard: "VocabShard | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """With ``vocab_shard``, verification is vocab-sharded over the TP group:
+    ``target_logits`` holds this rank's owned columns only, the per-block
+    kernels run on the owned blocks, and their partials are exchanged. The
+    result is the same as with the full target logits."""
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     assert draft_logits is None or (
         draft_logits.ndim == 3 and draft_logits.stride(-1) == 1
     )
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
+    target_col_start = 0
+    if vocab_shard is not None:
+        assert vocab_size == vocab_shard.num_cols
+        assert contexts is None and fly_window_size == 0
+        assert draft_logits_num_shards == 1
+        vocab_size = vocab_shard.vocab_size
+        target_col_start = vocab_shard.col_start
 
     watermark = contexts is not None
     assert watermark == (watermarking is not None) == (watermark_key is not None), (
@@ -1107,6 +1241,13 @@ def rejection_sample(
         # vocab size is larger than the draft's due to padding.
         vocab_size = min(vocab_size, draft_logits.size(-1))
 
+    fly_entropy = None
+    if fly_window_size > 0:
+        assert synthetic_conditional_rates is None and not use_block_verification
+        fly_entropy = compute_fly_entropy(
+            target_logits[:, :vocab_size], fly_entropy_top_k, from_logits=True
+        )
+
     # Compute the per-vocab-block logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential
     # (for non-greedy requests).
@@ -1128,7 +1269,11 @@ def rejection_sample(
     draft_local_sumexp = target_logits.new_empty(
         num_logits, vocab_num_blocks, dtype=torch.float32
     )
-    _compute_local_logits_stats_kernel[(num_logits, vocab_num_blocks)](
+    block_start, block_end = 0, vocab_num_blocks
+    if vocab_shard is not None:
+        assert vocab_num_blocks == vocab_shard.num_blocks
+        block_start, block_end = vocab_shard.block_start, vocab_shard.block_end
+    _compute_local_logits_stats_kernel[(num_logits, block_end - block_start)](
         target_local_argmax,
         target_local_argmax.stride(0),
         target_local_max,
@@ -1149,9 +1294,25 @@ def rejection_sample(
         temperature,
         vocab_size,
         num_logits,
+        block_start,
+        target_col_start,
         BLOCK_SIZE=VOCAB_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
+        DRAFT_LOGITS_NUM_SHARDS=draft_logits_num_shards,
     )
+    token_logits = None
+    if vocab_shard is not None:
+        stats = [target_local_argmax, target_local_max, target_local_sumexp]
+        if has_draft_logits:
+            stats += [draft_local_max, draft_local_sumexp]
+        vocab_shard.allgather_cols(stats, block_start, block_end)
+        token_logits = vocab_shard.token_logits(
+            target_logits,
+            draft_logits,
+            draft_sampled,
+            expanded_idx_mapping,
+            expanded_local_pos,
+        )
 
     # Precompute the running joint ratio and residual mass for block
     # verification.
@@ -1180,12 +1341,14 @@ def rejection_sample(
             draft_local_max.stride(0),
             draft_local_sumexp,
             draft_local_sumexp.stride(0),
+            token_logits,
             cu_num_logits,
             idx_mapping,
             temperature,
             vocab_num_blocks,
             PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
             HAS_DRAFT_LOGITS=has_draft_logits,
+            DRAFT_LOGITS_NUM_SHARDS=draft_logits_num_shards,
             num_warps=1,
         )
 
@@ -1197,7 +1360,7 @@ def rejection_sample(
             local_residual_mass = target_logits.new_empty(
                 num_logits, vocab_num_blocks, dtype=torch.float32
             )
-            _compute_local_residual_mass_kernel[(num_logits, vocab_num_blocks)](
+            _compute_local_residual_mass_kernel[(num_logits, block_end - block_start)](
                 local_residual_mass,
                 local_residual_mass.stride(0),
                 cumulative_log_p,
@@ -1221,9 +1384,16 @@ def rejection_sample(
                 vocab_size,
                 num_logits,
                 vocab_num_blocks,
+                block_start,
+                target_col_start,
                 BLOCK_SIZE=VOCAB_BLOCK_SIZE,
                 PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
+                DRAFT_LOGITS_NUM_SHARDS=draft_logits_num_shards,
             )
+            if vocab_shard is not None:
+                vocab_shard.allgather_cols(
+                    [local_residual_mass], block_start, block_end
+                )
         else:
             local_residual_mass = None
     else:
@@ -1269,11 +1439,16 @@ def rejection_sample(
         cumulative_log_p,
         local_residual_mass,
         local_residual_mass.stride(0) if local_residual_mass is not None else 0,
+        fly_entropy,
+        fly_entropy_threshold,
+        token_logits,
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
+        DRAFT_LOGITS_NUM_SHARDS=draft_logits_num_shards,
         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
         USE_BLOCK_VERIFICATION=use_block_verification,
+        FLY_WINDOW_SIZE=fly_window_size,
         num_warps=1,
     )
 
@@ -1289,7 +1464,11 @@ def rejection_sample(
         resample_num_blocks,
         dtype=torch.float64 if use_fp64 else torch.float32,
     )
-    _resample_kernel[(num_reqs, resample_num_blocks)](
+    rs_start, rs_end = 0, resample_num_blocks
+    if vocab_shard is not None:
+        rs_start = vocab_shard.col_start // RESAMPLE_BLOCK_SIZE
+        rs_end = triton.cdiv(vocab_shard.col_end, RESAMPLE_BLOCK_SIZE)
+    _resample_kernel[(num_reqs, rs_end - rs_start)](
         resampled_local_argmax,
         resampled_local_argmax.stride(0),
         resampled_local_max,
@@ -1316,14 +1495,22 @@ def rejection_sample(
         watermark_key_0,
         watermark_key_1,
         vocab_size,
+        rs_start,
+        target_col_start,
         BLOCK_SIZE=RESAMPLE_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,
+        DRAFT_LOGITS_NUM_SHARDS=draft_logits_num_shards,
         USE_FP64=use_fp64,
         USE_BLOCK_VERIFICATION=use_block_verification,
         CONTEXT_WIDTH=context_width,
         WATERMARK=watermark,
         DEDUPLICATE_CONTEXTS=watermarking_skip_mask is not None,
     )
+
+    if vocab_shard is not None:
+        vocab_shard.allgather_cols(
+            [resampled_local_argmax, resampled_local_max], rs_start, rs_end
+        )
 
     # Insert the resampled tokens into the output sampled.
     _insert_resampled_kernel[(num_reqs,)](
