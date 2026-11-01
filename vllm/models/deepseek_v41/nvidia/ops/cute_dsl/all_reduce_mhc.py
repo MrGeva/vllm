@@ -51,7 +51,6 @@ from vllm.models.common.ops.moe_tail_fusion.primitives import (
     load_global_bf16_as_f32,
     load_global_u32x2,
     load_global_u32x4,
-    load_global_u64,
     load_volatile_u32,
     make_fake_dynamic_compact_tensor,
     map_shared_to_peer,
@@ -64,7 +63,6 @@ from vllm.models.common.ops.moe_tail_fusion.primitives import (
     stmc_bf16x4,
     stmc_bf16x8,
     store_global_u32,
-    store_global_u32x2,
     store_global_u32x4,
     store_lamport_sentinel_u32x4,
     store_shared_cluster_f32,
@@ -261,14 +259,9 @@ class _QuadFinalizePublishDeviceKernel:
         enable_pdl: bool,
         prefetch_group: int,
         fp32_weights: bool = False,
-        two_shot_slots: int = 0,
     ) -> None:
         if hidden <= 0 or hidden % QUAD_BF16:
             raise ValueError("hidden must be a positive multiple of 4")
-        # Two-shot mode: token t goes to rank t % tp only, into mailbox row
-        # t // tp of a [generations, tp, two_shot_slots, hidden] mailbox, and the
-        # mailbox address argument is a device table of the ranks' mailboxes.
-        self.two_shot_slots = two_shot_slots
         self.hidden = hidden
         self.top_k = top_k
         self.tp = tp
@@ -287,6 +280,16 @@ class _QuadFinalizePublishDeviceKernel:
 
     def smem_size_in_bytes(self) -> int:
         return self.top_k * 8
+
+    def _store_contribution(
+        self, mailbox_address: Int64, stage, token: Int32, fragment: Int32, packed
+    ) -> None:
+        """Multicast this rank's fragment of a token's partial row into every
+        rank's mailbox [generations, tp, capacity_m, hidden]."""
+        mailbox_element = (
+            (Int64(stage) * self.tp + self.rank) * self.capacity_m + Int64(token)
+        ) * self.hidden + Int64(fragment) * QUAD_BF16
+        stmc_bf16x4(mailbox_address + mailbox_element * 2, packed)
 
     @cute.jit
     def __call__(
@@ -485,25 +488,9 @@ class _QuadFinalizePublishDeviceKernel:
                 result = result + shared_values.load().to(Float32)
             result_packed = bf16x4_to_packed_u32x2(result.to(BFloat16))
             packed = sanitize_negative_zero_u32x2(result_packed)
-            if cutlass.const_expr(self.two_shot_slots > 0):
-                owner = token % Int32(self.tp)
-                mailbox_element = (
-                    (Int64(stage) * self.tp + self.rank) * self.two_shot_slots
-                    + Int64(token // Int32(self.tp))
-                ) * self.hidden + Int64(fragment) * QUAD_BF16
-                owner_mailbox = load_global_u64(
-                    contribution_mailbox_multicast_address + Int64(owner) * 8
-                )
-                store_global_u32x2(owner_mailbox + mailbox_element * 2, packed)
-            else:
-                mailbox_element = (
-                    (Int64(stage) * self.tp + self.rank) * self.capacity_m
-                    + Int64(token)
-                ) * self.hidden + Int64(fragment) * QUAD_BF16
-                stmc_bf16x4(
-                    contribution_mailbox_multicast_address + mailbox_element * 2,
-                    packed,
-                )
+            self._store_contribution(
+                contribution_mailbox_multicast_address, stage, token, fragment, packed
+            )
 
         if block == 0 and tidx == 0:
             store_global_u32(

@@ -13,6 +13,14 @@ rank's fragment lands, reduces them, adds the residual and applies the Gemma
 RMSNorm. Instead of a BF16 row, the consumer writes the normalized row as MXFP8
 (E4M3 values and UE8M0 scales of 32-element blocks in the 128x4 swizzled
 layout), so the MXFP8 linear that follows skips its own input quantization.
+
+Larger batches use a two-shot all-reduce in three PDL-chained kernels. The
+publish sends each token's partial row only to its owner rank; the owner's
+reduce kernel sums the rows and multicasts the sum; the consumer then norms
+every token from its own gathered mailbox. A kernel only spins on stores of
+kernels that run before it (on this GPU or another), never on another CTA of
+its own grid, so the protocol cannot hang whatever the grid size, block
+dispatch order or occupancy (see vllm/models/inkling/nvidia/ops/lamport.py).
 """
 
 import math
@@ -41,12 +49,14 @@ from vllm.models.common.ops.moe_tail_fusion.primitives import (
     ACTIVE_STAGE,
     LAMPORT_GENERATIONS,
     NEXT_STAGE,
+    QUAD_BF16,
     VEC_BF16,
     WARP_SIZE,
     bf16x8_to_packed_u32x4,
     current_cu_stream,
     fragment_has_negative_zero,
     group_leader_block_sum,
+    load_global_nc_u64,
     load_global_u32x4,
     load_volatile_u32,
     make_fake_dynamic_compact_tensor,
@@ -55,6 +65,7 @@ from vllm.models.common.ops.moe_tail_fusion.primitives import (
     sanitize_negative_zero_u32x4,
     stmc_bf16x8,
     store_global_u32,
+    store_global_u32x2,
     store_global_u32x4,
     store_lamport_sentinel_u32x4,
     store_shared_cluster_f32,
@@ -205,6 +216,67 @@ def _swizzled_scale_offset(row: Int32, col: Int32, padded_cols: Int32) -> Int32:
     )
 
 
+@cute.jit
+def _lamport_wait_sum(
+    mailbox: cute.Tensor,
+    first_element: Int64,
+    row_stride: Int64,
+    rows: cutlass.Constexpr[int],
+    valid,
+):
+    """Spin until ``rows`` Lamport rows of one fragment hold data, then sum them
+    in row order in FP32 (zeros when not ``valid``). The rows start at element
+    ``first_element`` of ``mailbox``, ``row_stride`` elements apart. The
+    one-shot consumer and the two-shot reduce both sum with this, so their sums
+    are identical.
+    """
+    lane_packed = cute.make_rmem_tensor(cute.make_layout((rows, 4)), Uint32)
+    lane_packed.fill(Uint32(0))
+    dirty = valid
+    while dirty:
+        dirty = False
+        for row in cutlass.range_constexpr(rows):
+            pointer = cute.make_ptr(
+                BFloat16,
+                (mailbox.iterator + (first_element + row_stride * row)).llvm_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            packed = load_global_u32x4(pointer, volatile=True)
+            dirty = dirty | fragment_has_negative_zero(packed)
+            for word in cutlass.range_constexpr(4):
+                lane_packed[row, word] = packed[word]
+    total = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+    total.fill(Float32(0.0))
+    for row in cutlass.range_constexpr(rows):
+        packed = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
+        for word in cutlass.range_constexpr(4):
+            packed[word] = lane_packed[row, word]
+        total.store(total.load() + packed_u32x4_to_bf16x8(packed.load()).to(Float32))
+    return total.load()
+
+
+@cute.jit
+def _lamport_reset(
+    mailbox: cute.Tensor,
+    first_element: Int64,
+    row_stride: Int64,
+    rows: cutlass.Constexpr[int],
+) -> None:
+    """Restore the sentinel in the rows ``_lamport_wait_sum`` consumed."""
+    for row in cutlass.range_constexpr(rows):
+        store_lamport_sentinel_u32x4(
+            Int64((mailbox.iterator + (first_element + row_stride * row)).toint())
+        )
+
+
+def _check_two_shot(*, rank: int, tp: int, slots: int, capacity_m: int) -> None:
+    if not 0 <= rank < tp:
+        raise ValueError(f"rank {rank} is outside [0, {tp})")
+    if slots <= 0 or slots * tp < capacity_m:
+        raise ValueError(f"{slots} slots per rank cannot hold {capacity_m} tokens")
+
+
 class _LamportGemmaRMSNormMxfp8Kernel:
     """FlashInfer's ``_LamportResidualRMSNormDeviceKernel`` (residual add and
     copy, one rank lane) with a Gemma RMSNorm whose BF16 result is quantized to
@@ -213,6 +285,11 @@ class _LamportGemmaRMSNormMxfp8Kernel:
     A 32-element scale block is four consecutive fragments, which adjacent lanes
     hold, so two shuffles reduce its amax. The scales of the padding rows below
     the next multiple of 128 are zeroed, as FlashInfer's quantization does.
+
+    The mailbox is [generations, tp, capacity_m, hidden], and each token sums
+    its ``tp`` rows. The two-shot all-reduce passes its gathered mailbox of
+    finished sums instead, with ``tp=1`` and ``add_residual=False``, since the
+    reduce kernel already added the residual.
     """
 
     def __init__(
@@ -224,8 +301,7 @@ class _LamportGemmaRMSNormMxfp8Kernel:
         cluster_size: int,
         threads: int,
         enable_pdl: bool,
-        rank: int = 0,
-        two_shot_slots: int = 0,
+        add_residual: bool = True,
     ) -> None:
         if hidden <= 0 or hidden % (MXFP8_BLOCK * _SCALE_COL_TILE):
             raise ValueError("hidden must be a positive multiple of 128")
@@ -242,129 +318,10 @@ class _LamportGemmaRMSNormMxfp8Kernel:
         self.trips = math.ceil(self.fragments / self.fragment_stride)
         self.warps = threads // WARP_SIZE
         self.scale_cols = hidden // MXFP8_BLOCK
-        # Two-shot mode: the contribution mailbox is [generations, tp,
-        # two_shot_slots, hidden] and holds only the tokens t with
-        # t % tp == rank, at row t // tp. This rank reduces them, adds the
-        # residual and multicasts the BF16 sums into every rank's gathered
-        # mailbox [generations, capacity_m, hidden]; then every rank norms and
-        # quantizes every token from its gathered mailbox.
-        self.rank = rank
-        self.two_shot_slots = two_shot_slots
-        # The one-shot gather and mailbox reset loops; empty in two-shot mode.
-        self.trips_one_shot = 0 if two_shot_slots else self.trips
+        self.add_residual = add_residual
 
     def smem_size_in_bytes(self) -> int:
         return (self.warps + self.cluster_size) * 4
-
-    @cute.jit
-    def _two_shot_gather(
-        self,
-        contribution_mailbox: cute.Tensor,
-        gathered_mailbox: cute.Tensor,
-        gathered_multicast_address: Int64,
-        residual_output: cute.Tensor,
-        residual_fragments: cute.Tensor,
-        prenorm_fragments: cute.Tensor,
-        active_stage: Uint32,
-        token: Int32,
-        base_fragment: Int32,
-    ) -> None:
-        # Reduce-scatter: the owner sums the ranks' rows in rank order and
-        # adds the residual, exactly as the one-shot gather does.
-        if token % Int32(self.tp) == Int32(self.rank):
-            slot = Int64(token // Int32(self.tp))
-            for trip in cutlass.range_constexpr(self.trips):
-                fragment = base_fragment + trip * self.fragment_stride
-                lane_packed = cute.make_rmem_tensor(
-                    cute.make_layout((self.tp, 4)), Uint32
-                )
-                lane_packed.fill(Uint32(0))
-                dirty = fragment < self.fragments
-                while dirty:
-                    dirty = False
-                    for source_rank in cutlass.range_constexpr(self.tp):
-                        if fragment < self.fragments:
-                            source_element = (
-                                (Int64(active_stage) * self.tp + Int64(source_rank))
-                                * self.two_shot_slots
-                                + slot
-                            ) * self.hidden + Int64(fragment) * VEC_BF16
-                            source_pointer = cute.make_ptr(
-                                BFloat16,
-                                (
-                                    contribution_mailbox.iterator + source_element
-                                ).llvm_ptr,
-                                cute.AddressSpace.gmem,
-                                assumed_align=16,
-                            )
-                            packed = load_global_u32x4(source_pointer, volatile=True)
-                            dirty = dirty | fragment_has_negative_zero(packed)
-                            for word in cutlass.range_constexpr(4):
-                                lane_packed[source_rank, word] = packed[word]
-                if fragment < self.fragments:
-                    prenorm = cute.make_rmem_tensor(
-                        cute.make_layout((VEC_BF16,)), Float32
-                    )
-                    prenorm.fill(Float32(0.0))
-                    for source_rank in cutlass.range_constexpr(self.tp):
-                        packed = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
-                        for word in cutlass.range_constexpr(4):
-                            packed[word] = lane_packed[source_rank, word]
-                        prenorm.store(
-                            prenorm.load()
-                            + packed_u32x4_to_bf16x8(packed.load()).to(Float32)
-                        )
-                    prenorm_bf16 = (
-                        prenorm.load()
-                        + residual_fragments[trip, None].load().to(Float32)
-                    ).to(BFloat16)
-                    gathered_element = (
-                        Int64(active_stage) * self.capacity_m + Int64(token)
-                    ) * self.hidden + Int64(fragment) * VEC_BF16
-                    stmc_bf16x8(
-                        gathered_multicast_address + gathered_element * 2,
-                        sanitize_negative_zero_u32x4(
-                            bf16x8_to_packed_u32x4(prenorm_bf16)
-                        ),
-                    )
-                    for source_rank in cutlass.range_constexpr(self.tp):
-                        source_element = (
-                            (Int64(active_stage) * self.tp + Int64(source_rank))
-                            * self.two_shot_slots
-                            + slot
-                        ) * self.hidden + Int64(fragment) * VEC_BF16
-                        store_lamport_sentinel_u32x4(
-                            Int64(
-                                (contribution_mailbox.iterator + source_element).toint()
-                            )
-                        )
-        # All-gather: every rank takes every token's sum from its own mailbox.
-        for trip in cutlass.range_constexpr(self.trips):
-            fragment = base_fragment + trip * self.fragment_stride
-            if fragment < self.fragments:
-                gathered_element = (
-                    Int64(active_stage) * self.capacity_m + Int64(token)
-                ) * self.hidden + Int64(fragment) * VEC_BF16
-                gathered_pointer = cute.make_ptr(
-                    BFloat16,
-                    (gathered_mailbox.iterator + gathered_element).llvm_ptr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                gathered = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
-                dirty = fragment < self.fragments
-                while dirty:
-                    packed = load_global_u32x4(gathered_pointer, volatile=True)
-                    dirty = fragment_has_negative_zero(packed)
-                    for word in cutlass.range_constexpr(4):
-                        gathered[word] = packed[word]
-                prenorm_bf16 = packed_u32x4_to_bf16x8(gathered.load())
-                prenorm_fragments[trip, None].store(prenorm_bf16)
-                output_element = Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
-                store_global_u32x4(
-                    Int64((residual_output.iterator + output_element).toint()),
-                    bf16x8_to_packed_u32x4(prenorm_bf16),
-                )
 
     @cute.jit
     def __call__(
@@ -376,8 +333,6 @@ class _LamportGemmaRMSNormMxfp8Kernel:
         quant_output: cute.Tensor,
         scale_output: cute.Tensor,
         stage_state: cute.Tensor,
-        gathered_mailbox: cute.Tensor,
-        gathered_multicast_address: Int64,
         eps: Float32,
         m: Int32,
         stream: cuda.CUstream,
@@ -390,8 +345,6 @@ class _LamportGemmaRMSNormMxfp8Kernel:
             quant_output,
             scale_output,
             stage_state,
-            gathered_mailbox,
-            gathered_multicast_address,
             eps,
             m,
         ).launch(
@@ -413,8 +366,6 @@ class _LamportGemmaRMSNormMxfp8Kernel:
         quant_output: cute.Tensor,
         scale_output: cute.Tensor,
         stage_state: cute.Tensor,
-        gathered_mailbox: cute.Tensor,
-        gathered_multicast_address: Int64,
         eps: Float32,
         m: Int32,
     ) -> None:
@@ -452,72 +403,41 @@ class _LamportGemmaRMSNormMxfp8Kernel:
                 gamma_fragments[trip, None].store(
                     packed_u32x4_to_bf16x8(load_global_u32x4(gamma_pointer))
                 )
-                residual_element = Int64(token) * self.hidden + gamma_element
-                residual_pointer = cute.make_ptr(
-                    BFloat16,
-                    (residual_source.iterator + residual_element).llvm_ptr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                residual_fragments[trip, None].store(
-                    packed_u32x4_to_bf16x8(load_global_u32x4(residual_pointer))
-                )
+                if cutlass.const_expr(self.add_residual):
+                    residual_element = Int64(token) * self.hidden + gamma_element
+                    residual_pointer = cute.make_ptr(
+                        BFloat16,
+                        (residual_source.iterator + residual_element).llvm_ptr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    residual_fragments[trip, None].store(
+                        packed_u32x4_to_bf16x8(load_global_u32x4(residual_pointer))
+                    )
 
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
 
         active_stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
-        if cutlass.const_expr(self.two_shot_slots > 0):
-            self._two_shot_gather(
-                contribution_mailbox,
-                gathered_mailbox,
-                gathered_multicast_address,
-                residual_output,
-                residual_fragments,
-                prenorm_fragments,
-                active_stage,
-                token,
-                base_fragment,
-            )
-        for trip in cutlass.range_constexpr(self.trips_one_shot):
+        row_stride = Int64(self.capacity_m * self.hidden)
+        for trip in cutlass.range_constexpr(self.trips):
             fragment = base_fragment + trip * self.fragment_stride
-            lane_packed = cute.make_rmem_tensor(cute.make_layout((self.tp, 4)), Uint32)
-            lane_packed.fill(Uint32(0))
-            dirty = fragment < self.fragments
-            while dirty:
-                dirty = False
-                for source_rank in cutlass.range_constexpr(self.tp):
-                    if fragment < self.fragments:
-                        source_element = (
-                            (Int64(active_stage) * self.tp + Int64(source_rank))
-                            * self.capacity_m
-                            + Int64(token)
-                        ) * self.hidden + Int64(fragment) * VEC_BF16
-                        source_pointer = cute.make_ptr(
-                            BFloat16,
-                            (contribution_mailbox.iterator + source_element).llvm_ptr,
-                            cute.AddressSpace.gmem,
-                            assumed_align=16,
-                        )
-                        packed = load_global_u32x4(source_pointer, volatile=True)
-                        dirty = dirty | fragment_has_negative_zero(packed)
-                        for word in cutlass.range_constexpr(4):
-                            lane_packed[source_rank, word] = packed[word]
-
+            first_element = (
+                Int64(active_stage) * self.tp * self.capacity_m + Int64(token)
+            ) * self.hidden + Int64(fragment) * VEC_BF16
+            prenorm = _lamport_wait_sum(
+                contribution_mailbox,
+                first_element,
+                row_stride,
+                self.tp,
+                fragment < self.fragments,
+            )
             if fragment < self.fragments:
-                prenorm = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
-                prenorm.fill(Float32(0.0))
-                for source_rank in cutlass.range_constexpr(self.tp):
-                    packed = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
-                    for word in cutlass.range_constexpr(4):
-                        packed[word] = lane_packed[source_rank, word]
-                    prenorm.store(
-                        prenorm.load()
-                        + packed_u32x4_to_bf16x8(packed.load()).to(Float32)
+                if cutlass.const_expr(self.add_residual):
+                    prenorm = prenorm + residual_fragments[trip, None].load().to(
+                        Float32
                     )
-                prenorm_bf16 = (
-                    prenorm.load() + residual_fragments[trip, None].load().to(Float32)
-                ).to(BFloat16)
+                prenorm_bf16 = prenorm.to(BFloat16)
                 prenorm_fragments[trip, None].store(prenorm_bf16)
                 output_element = Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
                 store_global_u32x4(
@@ -535,26 +455,11 @@ class _LamportGemmaRMSNormMxfp8Kernel:
 
         for trip in cutlass.range_constexpr(self.trips):
             fragment = base_fragment + trip * self.fragment_stride
-            if cutlass.const_expr(self.two_shot_slots > 0):  # noqa: SIM102
-                if fragment < self.fragments:
-                    gathered_element = (
-                        Int64(active_stage) * self.capacity_m + Int64(token)
-                    ) * self.hidden + Int64(fragment) * VEC_BF16
-                    store_lamport_sentinel_u32x4(
-                        Int64((gathered_mailbox.iterator + gathered_element).toint())
-                    )
-        for trip in cutlass.range_constexpr(self.trips_one_shot):
-            fragment = base_fragment + trip * self.fragment_stride
-            for source_rank in cutlass.range_constexpr(self.tp):
-                if fragment < self.fragments:
-                    source_element = (
-                        (Int64(active_stage) * self.tp + Int64(source_rank))
-                        * self.capacity_m
-                        + Int64(token)
-                    ) * self.hidden + Int64(fragment) * VEC_BF16
-                    store_lamport_sentinel_u32x4(
-                        Int64((contribution_mailbox.iterator + source_element).toint())
-                    )
+            if fragment < self.fragments:
+                first_element = (
+                    Int64(active_stage) * self.tp * self.capacity_m + Int64(token)
+                ) * self.hidden + Int64(fragment) * VEC_BF16
+                _lamport_reset(contribution_mailbox, first_element, row_stride, self.tp)
 
         thread_sum = Float32(0.0)
         for trip in cutlass.range_constexpr(self.trips):
@@ -671,6 +576,151 @@ class _LamportGemmaRMSNormMxfp8Kernel:
             word = word + m * Int32(self.cluster_size * self.threads)
 
 
+class _TwoShotFinalizePublishKernel(_QuadFinalizePublishDeviceKernel):
+    """The finalize publish of the two-shot all-reduce. Token t goes only to its
+    owner rank t % tp, into row t // tp of that rank's scatter mailbox
+    [generations, tp, slots, hidden]. The mailbox address argument is the
+    device table of the ranks' scatter mailbox pointers.
+    """
+
+    def __init__(self, *, slots: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        _check_two_shot(
+            rank=self.rank, tp=self.tp, slots=slots, capacity_m=self.capacity_m
+        )
+        self.slots = slots
+
+    def _store_contribution(
+        self, mailbox_address: Int64, stage, token: Int32, fragment: Int32, packed
+    ) -> None:
+        # The table is constant, so the pointer load is pure and is not ordered
+        # after the finalize's loads.
+        owner_mailbox = load_global_nc_u64(
+            mailbox_address + Int64(token % Int32(self.tp)) * 8
+        )
+        mailbox_element = (
+            (Int64(stage) * self.tp + self.rank) * self.slots
+            + Int64(token // Int32(self.tp))
+        ) * self.hidden + Int64(fragment) * QUAD_BF16
+        store_global_u32x2(owner_mailbox + mailbox_element * 2, packed)
+
+
+class _TwoShotReduceKernel:
+    """The reduce of the two-shot all-reduce, between the publish and the
+    consumer. Each CTA of this rank takes one fragment range of a token it owns
+    (t % tp == rank), waits for every rank's row of it in the scatter mailbox,
+    sums them in rank order, adds the residual, rounds to BF16 and multicasts
+    the sum into every rank's gathered mailbox [generations, 1, capacity_m,
+    hidden], which the consumer reads with ``tp=1``.
+
+    It waits only for the publish kernels, so the consumer, which waits for this
+    kernel on every rank, never waits for a CTA of its own grid.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden: int,
+        tp: int,
+        rank: int,
+        slots: int,
+        capacity_m: int,
+        threads: int,
+        enable_pdl: bool,
+    ) -> None:
+        if hidden <= 0 or hidden % VEC_BF16:
+            raise ValueError("hidden must be a positive multiple of 8")
+        _check_two_shot(rank=rank, tp=tp, slots=slots, capacity_m=capacity_m)
+        self.hidden = hidden
+        self.tp = tp
+        self.rank = rank
+        self.slots = slots
+        self.capacity_m = capacity_m
+        self.threads = threads
+        self.enable_pdl = enable_pdl
+        self.fragments = hidden // VEC_BF16
+        self.ctas_per_token = math.ceil(self.fragments / threads)
+
+    @cute.jit
+    def __call__(
+        self,
+        scatter_mailbox: cute.Tensor,
+        residual_source: cute.Tensor,
+        gathered_multicast_address: Int64,
+        stage_state: cute.Tensor,
+        m: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        owned = (m + Int32(self.tp - 1)) // Int32(self.tp)
+        self.kernel(
+            scatter_mailbox,
+            residual_source,
+            gathered_multicast_address,
+            stage_state,
+            m,
+        ).launch(
+            grid=(owned * self.ctas_per_token, 1, 1),
+            block=(self.threads, 1, 1),
+            stream=stream,
+            use_pdl=self.enable_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        scatter_mailbox: cute.Tensor,
+        residual_source: cute.Tensor,
+        gathered_multicast_address: Int64,
+        stage_state: cute.Tensor,
+        m: Int32,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        slot = block // Int32(self.ctas_per_token)
+        fragment = (block % Int32(self.ctas_per_token)) * self.threads + tidx
+        token = slot * Int32(self.tp) + Int32(self.rank)
+        valid = (fragment < Int32(self.fragments)) & (token < m)
+
+        residual = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), BFloat16)
+        residual.fill(BFloat16(0.0))
+        if valid:
+            residual_pointer = cute.make_ptr(
+                BFloat16,
+                (
+                    residual_source.iterator
+                    + (Int64(token) * self.hidden + Int64(fragment) * VEC_BF16)
+                ).llvm_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            residual.store(packed_u32x4_to_bf16x8(load_global_u32x4(residual_pointer)))
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+            # Every CTA of this grid is running, so the consumer's CTAs cannot
+            # take the SMs it needs, and they wait for this grid to finish.
+            cute.arch.griddepcontrol_launch_dependents()
+
+        active_stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+        row_stride = Int64(self.slots * self.hidden)
+        first_element = (
+            Int64(active_stage) * self.tp * self.slots + Int64(slot)
+        ) * self.hidden + Int64(fragment) * VEC_BF16
+        total = _lamport_wait_sum(
+            scatter_mailbox, first_element, row_stride, self.tp, valid
+        )
+        if valid:
+            prenorm_bf16 = (total + residual.load().to(Float32)).to(BFloat16)
+            gathered_element = (
+                Int64(active_stage) * self.capacity_m + Int64(token)
+            ) * self.hidden + Int64(fragment) * VEC_BF16
+            stmc_bf16x8(
+                gathered_multicast_address + gathered_element * 2,
+                sanitize_negative_zero_u32x4(bf16x8_to_packed_u32x4(prenorm_bf16)),
+            )
+            _lamport_reset(scatter_mailbox, first_element, row_stride, self.tp)
+
+
 def mxfp8_scale_numel(num_tokens: int, hidden_size: int) -> int:
     """Bytes of the 128x4 swizzled UE8M0 scales of ``num_tokens`` rows."""
     rows = math.ceil(num_tokens / _SCALE_ROW_TILE) * _SCALE_ROW_TILE
@@ -680,18 +730,18 @@ def mxfp8_scale_numel(num_tokens: int, hidden_size: int) -> int:
 
 class FinalizeAllReduceGemmaRMSNormMxfp8:
     """MoE top-k finalize, TP all-reduce, residual add, Gemma RMSNorm and MXFP8
-    quantization in two PDL-chained launches.
+    quantization in PDL-chained launches.
 
     ``__call__`` takes an unfinalized MoE output plus its TP-partial shared-expert
     output and returns the MXFP8 normalized rows with the new residual. Batches
-    up to ``one_shot_max_tokens`` use a one-shot all-reduce: every rank
-    multicasts its rows and reduces all of them. Larger batches, up to
-    ``max_num_tokens``, use a two-shot all-reduce whose NVLink traffic per rank
-    is about half: each token's rows go to one owner rank, which reduces them,
-    adds the residual and multicasts the BF16 sum; every rank then norms and
-    quantizes every token. Both compute each sum in the same order, so their
-    outputs are identical. All layers share the Lamport mailboxes;
-    construction is collective over the TP group.
+    up to ``one_shot_max_tokens`` use a one-shot all-reduce in two launches:
+    every rank multicasts its rows and reduces all of them. Larger batches, up
+    to ``max_num_tokens``, use a two-shot all-reduce in three launches, whose
+    NVLink traffic per rank is about half: each token's rows go to one owner
+    rank, which reduces them, adds the residual and multicasts the BF16 sum;
+    every rank then norms and quantizes every token. Both compute each sum in
+    the same order, so their outputs are identical. All layers share the
+    Lamport mailboxes; construction is collective over the TP group.
     """
 
     def __init__(
@@ -704,63 +754,100 @@ class FinalizeAllReduceGemmaRMSNormMxfp8:
         device: torch.device,
         one_shot_max_tokens: int | None = None,
     ) -> None:
+        """``one_shot_max_tokens`` defaults to ``max_num_tokens`` (one-shot
+        only); 0 makes every batch two-shot."""
+        if max_num_tokens <= 0:
+            raise ValueError("max_num_tokens must be positive")
+        if one_shot_max_tokens is None:
+            one_shot_max_tokens = max_num_tokens
+        elif one_shot_max_tokens < 0:
+            raise ValueError("one_shot_max_tokens must not be negative")
         group = get_tp_group().device_group
         self.hidden_size = hidden = hidden_size
         self.max_num_tokens = max_num_tokens
-        self.capacity = capacity = min(
-            max_num_tokens, one_shot_max_tokens or max_num_tokens
-        )
+        self.capacity = capacity = min(max_num_tokens, one_shot_max_tokens)
         self.top_k = top_k
         self.fp32_weights = fp32_weights
         self.tp = tp = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
+        self.slots = slots = math.ceil(max_num_tokens / tp)
         device = torch.device(device)
+        # The rendezvous handles, which keep the peer mappings alive.
+        self._handles: list[object] = []
 
         with torch.accelerator.device_index(device.index):
-            self._publish, self._collective = self._compile(capacity, 0)
-            self._mailbox = self._lamport_buffer(
-                (LAMPORT_GENERATIONS, tp, capacity, hidden), device, group
-            )
-            self._multicast = self._multicast_address(self._mailbox_handle_last)
-            self._stage_state = torch.zeros(2, dtype=torch.int32, device=device)
-            # The one-shot consumer takes (and ignores) a gathered mailbox.
-            self._no_gathered_mailbox = torch.zeros(
-                8, dtype=torch.bfloat16, device=device
-            )
-
-            self._two_shot = max_num_tokens > capacity
-            if self._two_shot:
-                slots = math.ceil(max_num_tokens / tp)
-                self._publish_two_shot, self._collective_two_shot = self._compile(
-                    max_num_tokens, slots
+            if capacity:
+                shape = self._one_shot_mailbox_shape()
+                self._publish = self._compile_publish(capacity)
+                self._collective = self._compile_collective(
+                    capacity, tp, shape, add_residual=True
                 )
-                self._scatter_mailbox = self._lamport_buffer(
-                    (LAMPORT_GENERATIONS, tp, slots, hidden), device, group
+                self._mailbox, handle = self._lamport_buffer(shape, device, group)
+                self._multicast = self._multicast_address(handle)
+                self._stage_state = torch.zeros(2, dtype=torch.int32, device=device)
+            if max_num_tokens > capacity:
+                scatter_shape = self._scatter_mailbox_shape()
+                gathered_shape = self._gathered_mailbox_shape()
+                self._publish_two_shot = self._compile_publish(
+                    max_num_tokens, slots=slots
                 )
-                self._scatter_mailbox_ptrs = torch.tensor(
-                    list(self._mailbox_handle_last.buffer_ptrs),
-                    dtype=torch.int64,
-                    device=device,
+                self._reduce_two_shot = cute.compile(
+                    _TwoShotReduceKernel(
+                        hidden=hidden,
+                        tp=tp,
+                        rank=self.rank,
+                        slots=slots,
+                        capacity_m=max_num_tokens,
+                        threads=128,
+                        enable_pdl=True,
+                    ),
+                    make_fake_compact_tensor(
+                        BFloat16, (math.prod(scatter_shape),), assumed_align=16
+                    ),
+                    make_fake_dynamic_compact_tensor(
+                        BFloat16, alignment=16, divisibility=hidden
+                    ),
+                    Int64(0),
+                    make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+                    Int32(max_num_tokens),
+                    current_cu_stream(),
                 )
-                self._gathered_mailbox = self._lamport_buffer(
-                    (LAMPORT_GENERATIONS, max_num_tokens, hidden), device, group
+                self._collective_two_shot = self._compile_collective(
+                    max_num_tokens, 1, gathered_shape, add_residual=False
                 )
-                self._gathered_multicast = self._multicast_address(
-                    self._mailbox_handle_last
+                self._scatter_mailbox, scatter_handle = self._lamport_buffer(
+                    scatter_shape, device, group
                 )
+                # The publish stores into the owner's mailbox through this
+                # device table of the ranks' mailbox pointers.
+                self._scatter_mailbox_ptrs = int(scatter_handle.buffer_ptrs_dev)
+                self._gathered_mailbox, gathered_handle = self._lamport_buffer(
+                    gathered_shape, device, group
+                )
+                self._gathered_multicast = self._multicast_address(gathered_handle)
                 self._stage_state_two_shot = torch.zeros(
                     2, dtype=torch.int32, device=device
                 )
             torch.accelerator.synchronize()
         dist.barrier(group=group)
 
-    def _lamport_buffer(self, shape, device, group) -> torch.Tensor:
+    def _one_shot_mailbox_shape(self) -> tuple[int, ...]:
+        return (LAMPORT_GENERATIONS, self.tp, self.capacity, self.hidden_size)
+
+    def _scatter_mailbox_shape(self) -> tuple[int, ...]:
+        return (LAMPORT_GENERATIONS, self.tp, self.slots, self.hidden_size)
+
+    def _gathered_mailbox_shape(self) -> tuple[int, ...]:
+        return (LAMPORT_GENERATIONS, 1, self.max_num_tokens, self.hidden_size)
+
+    def _lamport_buffer(self, shape, device, group):
+        """A symmetric BF16 buffer filled with the Lamport sentinel (BF16
+        negative zero) and its rendezvous handle, which is kept alive."""
         buffer = symm_mem.empty(shape, dtype=torch.bfloat16, device=device)
-        self._mailbox_handle_last = symm_mem.rendezvous(buffer, group)
-        self._handles = getattr(self, "_handles", []) + [self._mailbox_handle_last]
-        # Every slot starts as the Lamport sentinel, BF16 negative zero.
+        handle = symm_mem.rendezvous(buffer, group)
+        self._handles.append(handle)
         buffer.view(torch.int16).fill_(-32768)
-        return buffer
+        return buffer, handle
 
     @staticmethod
     def _multicast_address(handle) -> int:
@@ -769,34 +856,31 @@ class FinalizeAllReduceGemmaRMSNormMxfp8:
             raise RuntimeError("NVLink multicast mapping is unavailable")
         return multicast
 
-    def _compile(self, capacity: int, two_shot_slots: int):
-        hidden, top_k, tp = self.hidden_size, self.top_k, self.tp
-        fp32_weights = self.fp32_weights
-        # A cluster of 128-thread CTAs covers a token's fragments in one trip
-        # (six for hidden 6144); the finalize stages all top_k routes at once.
-        cluster_size = math.ceil(hidden // VEC_BF16 / 128)
-        mailbox_numel = (
-            LAMPORT_GENERATIONS * tp * two_shot_slots * hidden
-            if two_shot_slots
-            else LAMPORT_GENERATIONS * tp * capacity * hidden
+    def _compile_publish(self, capacity: int, *, slots: int = 0):
+        top_k, fp32_weights = self.top_k, self.fp32_weights
+        kwargs = dict(
+            hidden=self.hidden_size,
+            top_k=top_k,
+            tp=self.tp,
+            rank=self.rank,
+            capacity_m=capacity,
+            threads=128,
+            # The routing weights already carry routed_scaling_factor.
+            routed_scaling_factor=1.0,
+            include_shared_expert=True,
+            load_shared_expert_before_pdl=False,
+            enable_pdl=True,
+            prefetch_group=top_k,
+            fp32_weights=fp32_weights,
         )
-        publish = cute.compile(
-            _QuadFinalizePublishDeviceKernel(
-                hidden=hidden,
-                top_k=top_k,
-                tp=tp,
-                rank=self.rank,
-                capacity_m=capacity,
-                threads=128,
-                # The routing weights already carry routed_scaling_factor.
-                routed_scaling_factor=1.0,
-                include_shared_expert=True,
-                load_shared_expert_before_pdl=False,
-                enable_pdl=True,
-                prefetch_group=top_k,
-                fp32_weights=fp32_weights,
-                two_shot_slots=two_shot_slots,
-            ),
+        kernel = (
+            _TwoShotFinalizePublishKernel(slots=slots, **kwargs)
+            if slots
+            else _QuadFinalizePublishDeviceKernel(**kwargs)
+        )
+        hidden = self.hidden_size
+        return cute.compile(
+            kernel,
             make_fake_dynamic_compact_tensor(
                 BFloat16, alignment=16, divisibility=hidden
             ),
@@ -814,18 +898,26 @@ class FinalizeAllReduceGemmaRMSNormMxfp8:
             Int32(capacity),
             current_cu_stream(),
         )
-        collective = cute.compile(
+
+    def _compile_collective(
+        self, capacity: int, rows: int, mailbox_shape, *, add_residual: bool
+    ):
+        hidden = self.hidden_size
+        return cute.compile(
             _LamportGemmaRMSNormMxfp8Kernel(
                 hidden=hidden,
-                tp=tp,
+                tp=rows,
                 capacity_m=capacity,
-                cluster_size=cluster_size,
+                # A cluster of 128-thread CTAs covers a token's fragments in one
+                # trip (six for hidden 6144).
+                cluster_size=math.ceil(hidden // VEC_BF16 / 128),
                 threads=128,
                 enable_pdl=True,
-                rank=self.rank,
-                two_shot_slots=two_shot_slots,
+                add_residual=add_residual,
             ),
-            make_fake_compact_tensor(BFloat16, (mailbox_numel,), assumed_align=16),
+            make_fake_compact_tensor(
+                BFloat16, (math.prod(mailbox_shape),), assumed_align=16
+            ),
             make_fake_dynamic_compact_tensor(
                 BFloat16, alignment=16, divisibility=hidden
             ),
@@ -838,17 +930,10 @@ class FinalizeAllReduceGemmaRMSNormMxfp8:
                 Uint8, alignment=16, divisibility=_SCALE_ROW_TILE
             ),
             make_fake_compact_tensor(Int32, (2,), assumed_align=4),
-            make_fake_compact_tensor(
-                BFloat16,
-                (LAMPORT_GENERATIONS * capacity * hidden if two_shot_slots else 8,),
-                assumed_align=16,
-            ),
-            Int64(0),
             Float32(0.0),
             Int32(capacity),
             current_cu_stream(),
         )
-        return publish, collective
 
     def __call__(
         self,
@@ -876,7 +961,6 @@ class FinalizeAllReduceGemmaRMSNormMxfp8:
         m = residual.shape[0]
         if not 1 <= m <= self.max_num_tokens:
             raise ValueError(f"M={m} is outside [1, {self.max_num_tokens}]")
-        two_shot = m > self.capacity
         if residual.shape != (m, hidden) or shared_output.shape != (m, hidden):
             raise ValueError("residual and shared_output must be [M, hidden]")
         weights_dtype = torch.float32 if self.fp32_weights else torch.bfloat16
@@ -885,21 +969,18 @@ class FinalizeAllReduceGemmaRMSNormMxfp8:
             or routed.expert_weights.numel() != m * top_k
         ):
             raise ValueError(f"expert_weights must be {weights_dtype} [M, top_k]")
+        two_shot = m > self.capacity
         if two_shot:
             publish, collective = self._publish_two_shot, self._collective_two_shot
-            stage_state = self._stage_state_two_shot
-            mailbox_address = self._scatter_mailbox_ptrs.data_ptr()
-            mailbox = self._scatter_mailbox
-            gathered, gathered_multicast = (
-                self._gathered_mailbox,
-                self._gathered_multicast,
-            )
+            stage_state = to_cute(self._stage_state_two_shot, 4)
+            mailbox_address = self._scatter_mailbox_ptrs
+            mailbox = self._gathered_mailbox
         else:
             publish, collective = self._publish, self._collective
-            stage_state = self._stage_state
+            stage_state = to_cute(self._stage_state, 4)
             mailbox_address = self._multicast
             mailbox = self._mailbox
-            gathered, gathered_multicast = self._no_gathered_mailbox, 0
+        residual_source = to_cute_dynamic(residual.flatten(), 16, divisibility=hidden)
         publish(
             to_cute_dynamic(routed.gemm2_permuted.flatten(), 16, divisibility=hidden),
             to_cute_dynamic(
@@ -911,11 +992,20 @@ class FinalizeAllReduceGemmaRMSNormMxfp8:
                 routed.expanded_idx_to_permuted_idx.flatten(), 4, divisibility=top_k
             ),
             to_cute_dynamic(shared_output.flatten(), 16, divisibility=hidden),
-            to_cute(stage_state, 4),
+            stage_state,
             Int64(mailbox_address),
             Int32(m),
             current_cu_stream(),
         )
+        if two_shot:
+            self._reduce_two_shot(
+                to_cute(self._scatter_mailbox.flatten(), 16),
+                residual_source,
+                Int64(self._gathered_multicast),
+                stage_state,
+                Int32(m),
+                current_cu_stream(),
+            )
         residual_output = torch.empty_like(residual)
         quantized = torch.empty(
             (m, hidden), dtype=torch.float8_e4m3fn, device=residual.device
@@ -925,16 +1015,14 @@ class FinalizeAllReduceGemmaRMSNormMxfp8:
         )
         collective(
             to_cute(mailbox.flatten(), 16),
-            to_cute_dynamic(residual.flatten(), 16, divisibility=hidden),
+            residual_source,
             to_cute(norm_weight, 16),
             to_cute_dynamic(residual_output.flatten(), 16, divisibility=hidden),
             to_cute_dynamic(
                 quantized.view(torch.uint8).flatten(), 16, divisibility=hidden
             ),
             to_cute_dynamic(scales, 16, divisibility=_SCALE_ROW_TILE),
-            to_cute(stage_state, 4),
-            to_cute(gathered.flatten(), 16),
-            Int64(gathered_multicast),
+            stage_state,
             Float32(norm_eps),
             Int32(m),
             current_cu_stream(),
