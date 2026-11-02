@@ -281,6 +281,16 @@ class _QuadFinalizePublishDeviceKernel:
     def smem_size_in_bytes(self) -> int:
         return self.top_k * 8
 
+    def _store_contribution(
+        self, mailbox_address: Int64, stage, token: Int32, fragment: Int32, packed
+    ) -> None:
+        """Multicast this rank's fragment of a token's partial row into every
+        rank's mailbox [generations, tp, capacity_m, hidden]."""
+        mailbox_element = (
+            (Int64(stage) * self.tp + self.rank) * self.capacity_m + Int64(token)
+        ) * self.hidden + Int64(fragment) * QUAD_BF16
+        stmc_bf16x4(mailbox_address + mailbox_element * 2, packed)
+
     @cute.jit
     def __call__(
         self,
@@ -478,12 +488,8 @@ class _QuadFinalizePublishDeviceKernel:
                 result = result + shared_values.load().to(Float32)
             result_packed = bf16x4_to_packed_u32x2(result.to(BFloat16))
             packed = sanitize_negative_zero_u32x2(result_packed)
-            mailbox_element = (
-                (Int64(stage) * self.tp + self.rank) * self.capacity_m + Int64(token)
-            ) * self.hidden + Int64(fragment) * QUAD_BF16
-            stmc_bf16x4(
-                contribution_mailbox_multicast_address + mailbox_element * 2,
-                packed,
+            self._store_contribution(
+                contribution_mailbox_multicast_address, stage, token, fragment, packed
             )
 
         if block == 0 and tidx == 0:

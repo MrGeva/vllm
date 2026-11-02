@@ -145,6 +145,23 @@ def load_volatile_u32(pointer: cute.Pointer, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def load_global_nc_u64(address: Int64, *, loc=None, ip=None) -> Int64:
+    """Load one 64-bit word that no kernel writes, such as a pointer from a
+    device table. The load is pure, so it can be scheduled early."""
+    return Int64(
+        _asm(
+            T.i64(),
+            [address.ir_value(loc=loc, ip=ip)],
+            "ld.global.nc.u64 $0, [$1];",
+            "=l,l",
+            side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def store_global_u32x4(
     address: Int64,
     packed,
