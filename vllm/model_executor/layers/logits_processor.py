@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_gather,
 )
@@ -21,6 +22,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import has_flashinfer
 
 logger = init_logger(__name__)
@@ -51,6 +53,69 @@ def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     if impl is None or not scores.is_cuda:
         return torch.topk(scores, k, dim=-1)
     return impl(scores, k, sorted=True, deterministic=True)
+
+
+@triton.jit(do_not_specialize=["num_rows"])
+def _vocab_gather_layout_kernel(
+    gathered_ptr,  # [world, num_rows, shard_size], rank-major
+    out_ptr,  # [num_rows, vocab_size]
+    num_rows,
+    shard_size,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # grid: (world * num_rows, cdiv(shard_size, BLOCK_SIZE))
+    rank_row = tl.program_id(0).to(tl.int64)
+    rank = rank_row // num_rows
+    row = rank_row % num_rows
+    cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    out_cols = rank * shard_size + cols
+    mask = (cols < shard_size) & (out_cols < vocab_size)
+    values = tl.load(gathered_ptr + rank_row * shard_size + cols, mask=mask)
+    tl.store(
+        out_ptr + row * vocab_size + out_cols,
+        values.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def all_gather_vocab_parallel_logits(
+    logits: torch.Tensor, vocab_size: int, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """TP all-gather of vocab-parallel logits [num_rows, shard_size] into a new
+    contiguous [num_rows, vocab_size] tensor of ``out_dtype``.
+
+    Gathers along rows (the rank-major layout NCCL produces, no copy) and
+    writes the vocab-major result, the padding cut off and the dtype cast in
+    one pass. It replaces a last-dim all-gather's layout copy, the vocab
+    slice and any later cast; casting up is exact.
+    """
+    num_rows, shard_size = logits.shape
+    tp_group = get_tp_group()
+    if vocab_size > tp_group.world_size * shard_size:
+        raise ValueError(
+            f"vocab_size {vocab_size} exceeds the {tp_group.world_size} "
+            f"gathered shards of {shard_size} columns"
+        )
+    # Gathering dim 1 of [1, rows, shard] gives the same rank-major layout as
+    # a dim-0 gather, but stays off the dim-0 symmetric-memory route, which
+    # gathers into a scratch buffer and returns a full-size clone of it.
+    gathered = tp_group.all_gather(logits.contiguous().unsqueeze(0), dim=1)
+    out = torch.empty((num_rows, vocab_size), dtype=out_dtype, device=logits.device)
+    if num_rows == 0:
+        return out
+    BLOCK_SIZE = 2048
+    grid = (gathered.shape[1], triton.cdiv(shard_size, BLOCK_SIZE))
+    _vocab_gather_layout_kernel[grid](
+        gathered,
+        out,
+        num_rows,
+        shard_size,
+        vocab_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+    )
+    return out
 
 
 # --8<-- [start:logits_processor]
@@ -94,6 +159,12 @@ class LogitsProcessor(PluggableLayer):
         # required for RL training-inference consistency.
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        # Set to torch.float32 by a caller that would cast the gathered logits
+        # to FP32 anyway (the model runner, for a model that opts in with
+        # SupportsFP32LogitsGather); the fused gather then writes FP32
+        # where nothing in this layer runs on the logits after the gather.
+        # None keeps the head's dtype.
+        self.gather_out_dtype: torch.dtype | None = None
 
     def forward(
         self,
@@ -118,6 +189,27 @@ class LogitsProcessor(PluggableLayer):
             if self.scale != 1.0:
                 logits *= self.scale
         return logits
+
+    def _fused_gather_dtype(self, logits: torch.Tensor) -> torch.dtype | None:
+        """Output dtype of the fused vocab-parallel gather of ``logits``, or
+        None where the fused gather does not apply."""
+        if not (
+            self.use_all_gather
+            and current_platform.is_cuda()
+            and logits.dim() == 2
+            and logits.shape[-1] * get_tp_group().world_size >= self.org_vocab_size
+            # A subclass's own gather (e.g. a custom all-gather) is kept.
+            and type(self)._gather_logits is LogitsProcessor._gather_logits
+        ):
+            return None
+        if (
+            self.gather_out_dtype == torch.float32
+            # The scale and soft cap run after the gather, in its dtype.
+            and self.scale == 1.0
+            and self.soft_cap is None
+        ):
+            return torch.float32
+        return logits.dtype
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """gather/all-gather the logits tensor across model parallel group."""
@@ -191,6 +283,11 @@ class LogitsProcessor(PluggableLayer):
 
         # Gather logits for TP
         if lm_head.tp_size > 1:
+            out_dtype = self._fused_gather_dtype(logits)
+            if out_dtype is not None:
+                return all_gather_vocab_parallel_logits(
+                    logits, self.org_vocab_size, out_dtype
+                )
             logits = self._gather_logits(logits)
 
         # Remove paddings in vocab (if any).

@@ -260,6 +260,7 @@ class RejectionSampler:
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
+        logits_writable: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         processed_logits = self.sampler.apply_sampling_params(
             logits,
@@ -270,6 +271,7 @@ class RejectionSampler:
             draft_sampled,
             expanded_local_pos,
             seq_lens_upper_bound_np,
+            logits_writable=logits_writable,
         )
         sampled, num_sampled = rejection_sample(
             processed_logits,
@@ -308,6 +310,7 @@ class RejectionSampler:
         pos: torch.Tensor,
         max_chunk_logits: int,
         max_num_logprobs: int,
+        logits_writable: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -357,6 +360,7 @@ class RejectionSampler:
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
                 input_batch.seq_lens_cpu_upper_bound.numpy()[start:end],
+                logits_writable=logits_writable,
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
@@ -418,7 +422,10 @@ class RejectionSampler:
         logits: torch.Tensor,
         input_batch: InputBatch,
         draft_logits: DraftLogitsCache | None = None,
+        logits_writable: bool = False,
     ) -> SamplerOutput:
+        """``logits_writable``: verification may process ``logits`` in place
+        (see ``Sampler.can_process_logits_in_place``)."""
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
@@ -449,6 +456,7 @@ class RejectionSampler:
             pos,
             chunk_logit_limit,
             max_num_logprobs,
+            logits_writable=logits_writable,
         )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
