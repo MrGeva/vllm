@@ -207,6 +207,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
         self.use_custom_op_call = (
             current_platform.is_cuda_alike() or current_platform.is_tpu()
         )
+        self.custom_op_only_when_compiling = current_platform.is_cuda_alike()
         self.use_cpu_custom_send_recv = False
 
     def destroy(self):

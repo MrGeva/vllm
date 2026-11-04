@@ -1103,3 +1103,20 @@ def direct_register_custom_op(
     my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
     if fake_impl is not None:
         my_lib._register_fake(op_name, fake_impl)
+
+
+def eager_bypass_custom_op(
+    op_name: str,
+    op_func: Callable,
+    target_lib: Library | None = None,
+) -> Callable:
+    """Backport of main's helper (#64417): Dynamo tracing goes through the
+    custom op, eager calls straight to ``op_func``."""
+    op = getattr(getattr(torch.ops, (target_lib or vllm_lib).ns), op_name)
+
+    def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return op(*args, **kwargs)
+        return op_func(*args, **kwargs)
+
+    return wrapper

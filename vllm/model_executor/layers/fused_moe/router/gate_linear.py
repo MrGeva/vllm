@@ -13,7 +13,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op, eager_bypass_custom_op
 
 logger = init_logger(__name__)
 
@@ -305,7 +305,7 @@ class GateLinear(ReplicatedLinear):
                     self.prefix,
                 )
             else:
-                output = torch.ops.vllm.rocm_bf16x3_router_gemm_dispatch(
+                output = rocm_bf16x3_router_gemm_dispatch(
                     x, self.weight, self._bf16x3_weight
                 )
                 return self._return(output)
@@ -317,7 +317,7 @@ class GateLinear(ReplicatedLinear):
             torch.float32,
             torch.bfloat16,
         ):
-            output = torch.ops.vllm.fp32_router_gemm_dispatch(
+            output = fp32_router_gemm_dispatch(
                 x, self.weight, self.allow_bf16x3_router_gemm
             )
             return self._return(output)
@@ -347,7 +347,7 @@ class GateLinear(ReplicatedLinear):
         # Tier 6: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             if self.is_gfx950:
-                output = torch.ops.vllm.fp32_router_gemm_dispatch(x, self.weight, False)
+                output = fp32_router_gemm_dispatch(x, self.weight, False)
             else:
                 output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return self._return(output)
@@ -511,4 +511,12 @@ direct_register_custom_op(
     op_name="fp32_router_gemm_dispatch",
     op_func=fp32_router_gemm_dispatch_impl,
     fake_impl=fp32_router_gemm_dispatch_fake,
+)
+
+# The custom ops above are Dynamo boundaries; eager calls skip the dispatcher.
+fp32_router_gemm_dispatch = eager_bypass_custom_op(
+    "fp32_router_gemm_dispatch", fp32_router_gemm_dispatch_impl
+)
+rocm_bf16x3_router_gemm_dispatch = eager_bypass_custom_op(
+    "rocm_bf16x3_router_gemm_dispatch", rocm_bf16x3_router_gemm_dispatch_impl
 )
