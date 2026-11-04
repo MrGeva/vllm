@@ -30,7 +30,10 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphWrapper,
+    is_breakable_cudagraph_enabled,
+)
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.wrapper import compile_model_with_stock_torch
@@ -41,7 +44,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -91,6 +94,7 @@ from vllm.v1.watermarking.spec_decode import (
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.extensible_kv_cache import ExtensibleKVCache
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
@@ -174,6 +178,10 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import (
     DraftTokensHandler,
     get_drafter_hidden_states,
+)
+from vllm.v1.worker.gpu.spec_decode.vocab_shard import (
+    VocabShard,
+    vocab_shard_unsupported_reason,
 )
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -342,6 +350,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
         self.batch_sharder: BatchSharder | None = None
+        self.vocab_shard: VocabShard | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
@@ -547,6 +556,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 device=self.device,
                 mask_stride=self.decode_query_len,
             )
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.vocab_sharded_verification
+            ):
+                self.vocab_shard = self._init_vocab_shard()
+                enable = getattr(self.speculator, "enable_vocab_sharded_drafting", None)
+                if enable is not None:
+                    enable(self.vocab_shard)
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
@@ -641,11 +658,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager | None = None,
+        extensible: bool = False,
     ) -> None:
+        """Initialize the KV cache and everything that depends on its layout.
+
+        With `extensible=True`, num_blocks is a capacity: address space is
+        reserved for it but only the null block is committed before capture.
+        """
         # GPUWorker finalizes the PD interleave before KV cache initialization.
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self.extensible_kv_cache: ExtensibleKVCache | None = None
+        if extensible:
+            self.extensible_kv_cache = ExtensibleKVCache(
+                kv_cache_config,
+                self.device,
+                self.cache_config.get_resolved_kv_cache_layout(),
+            )
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -762,7 +792,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             use_replayssm=self.cache_config.use_replayssm,
         )
         piecewise_capture_available = bool(
-            envs.VLLM_USE_BREAKABLE_CUDAGRAPH or has_compiled_submodule(self.model)
+            is_breakable_cudagraph_enabled(self.vllm_config.compilation_config)
+            or has_compiled_submodule(self.model)
         )
         if self.adaptive_verification is not None:
             self.compilation_config.cudagraph_mode = resolve_adaptive_cudagraph_mode(
@@ -807,6 +838,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # to its own attention support.
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
+        allocate_fn = None
+        if self.extensible_kv_cache is not None:
+            allocate_fn = self.extensible_kv_cache.allocate
+
         # Capture warmup providers that depend on allocated KV-cache strides.
         with self.jit_warmup_registry.activate():
             kv_caches_dict = init_kv_cache(
@@ -824,6 +859,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     + getattr(self.speculator, "attn_groups", [])
                     for g in groups
                 ),
+                allocate=allocate_fn,
             )
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
@@ -832,6 +868,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
+            self.kv_caches_by_layer = kv_caches_dict
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
             # AuxOutput connector requires resolved kv_cache_config.
@@ -887,13 +924,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs = num_tokens // self.decode_query_len
             assert num_tokens % self.decode_query_len == 0
         elif self.speculator is not None:
+            assert self.speculative_config is not None
             num_reqs = min(
                 num_reqs, self.max_num_tokens // self.speculator.num_query_per_req
             )
             num_tokens = min(
                 num_tokens,
                 self.max_num_tokens
-                - num_reqs * self.speculator.num_extra_query_per_req,
+                - num_reqs * self.speculative_config.max_num_new_slots_for_drafting,
             )
 
         assert num_tokens <= self.max_num_tokens, (
@@ -1092,6 +1130,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
         """Estimate the GPU memory required to capture CUDA graphs."""
+        if self.cache_config.enable_extensible_kv_cache:
+            # The extensible KV cache measures the capture footprint after warmup.
+            return 0
         # Runs before the KV cache exists, outside compile_or_warm_up_model.
         with self.eplb.suppress():
             return _profile_cudagraph_memory(self)
@@ -1219,6 +1260,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.
             self.pooling_runner.on_requests_finished(finished_req_ids)
+        if self.speculator is not None and finished_req_ids:
+            self.speculator.on_requests_finished(finished_req_ids)
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
@@ -1263,6 +1306,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
+            if self.speculator is not None:
+                self.speculator.add_request(req_index)
 
             if self.pooling_runner is not None:
                 assert new_req_data.pooling_params is not None
@@ -1659,12 +1704,95 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _init_vocab_shard(self) -> VocabShard | None:
+        """Vocab-sharded verification, if this configuration supports it.
+        Collective: every TP rank reaches the same decision."""
+        reason = None
+        draft_logits = getattr(self.speculator, "draft_logits", None)
+        if not isinstance(self.rejection_sampler, RejectionSampler):
+            reason = "the rejection sampler is not the default one"
+        elif self.batch_sharder is not None:
+            reason = "batch-sharded sampling is enabled"
+        elif self.pcp_manager is not None:
+            reason = "prefill context parallelism is enabled"
+        elif not current_platform.is_cuda():
+            reason = "it needs CUDA"
+        elif not hasattr(self.model, "compute_logits_local"):
+            reason = (
+                f"{type(self.model).__name__} does not implement compute_logits_local"
+            )
+        else:
+            reason = self.rejection_sampler.vocab_sharding_unsupported_reason(
+                draft_logits
+            )
+        shard = None
+        if reason is None:
+            assert self.rejection_sampler is not None and draft_logits is not None
+            hidden = torch.zeros(
+                1,
+                self.model_config.get_hidden_size(),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            local_logits = self.model.compute_logits_local(hidden)
+            reason = vocab_shard_unsupported_reason(
+                self.vocab_size, local_logits.shape[-1], get_tp_group().world_size
+            )
+            if draft_logits.values.shape[-1] != self.vocab_size:
+                reason = "the draft logits do not cover the target vocabulary"
+        if reason is None:
+            shard, reason = VocabShard.create(
+                self.vocab_size,
+                local_logits.shape[-1],
+                max_num_logits=self.max_num_reqs * self.decode_query_len,
+                max_num_reqs=self.max_num_reqs,
+                logits_dtype=local_logits.dtype,
+                device=self.device,
+            )
+        if shard is None:
+            logger.warning("vocab_sharded_verification is ignored because %s.", reason)
+            return None
+        assert self.rejection_sampler is not None and draft_logits is not None
+        self.rejection_sampler.warmup_vocab_sharded(shard, draft_logits)
+        logger.info(
+            "Vocab-sharded verification: this rank owns vocabulary columns [%d, %d).",
+            shard.col_start,
+            shard.col_end,
+        )
+        return shard
+
     def sample(
         self,
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        if (
+            self.vocab_shard is not None
+            and input_batch.num_reqs > 0
+            and input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+        ):
+            self.vocab_shard.check_exchange()
+            assert self.speculator is not None
+            draft_logits = self.speculator.draft_logits
+            if grammar_output is None and (
+                self.rejection_sampler.supports_vocab_sharding(
+                    input_batch, draft_logits
+                )
+            ):
+                local_logits = self.model.compute_logits_local(
+                    hidden_states[input_batch.logits_indices]
+                )
+                out = self.rejection_sampler.verify_vocab_sharded(
+                    local_logits, input_batch, draft_logits, self.vocab_shard
+                )
+                return out, out.num_sampled, out.num_rejected
+            # Verified in full: complete vocab-sharded draft logits first.
+            complete = getattr(self.speculator, "complete_draft_logits", None)
+            if complete is not None:
+                complete(input_batch.idx_mapping)
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
@@ -1731,12 +1859,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 local_batch=input_batch,
                 gather_num_nans=self.sampler.compute_nans,
                 logprobs_dims=self.sampler.get_logprobs_dims(
-                    global_input_batch.idx_mapping_np,
-                    # Rejection sampler does not return logprob token ids.
-                    include_token_ids=(
-                        global_input_batch.num_draft_tokens == 0
-                        or self.rejection_sampler is None
-                    ),
+                    global_input_batch.idx_mapping_np
                 ),
             )
 
@@ -1832,9 +1955,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
-            if batch_req_state.has_prefill:
-                # Varlen decode graphs replay decodes only, and their bound
-                # alone would admit a short prefill.
+            if not batch_req_state.decode_graph_eligible:
+                # A query-length bound alone would admit a short prefill.
                 max_query_len = None
             if self.pcp_manager is not None:
                 num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
@@ -1940,11 +2062,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch, valid_dummy_state_slots
                 )
                 if context_len:
+                    if self.extensible_kv_cache is not None:
+                        num_blocks = self.extensible_kv_cache.num_committed_blocks
+                    else:
+                        num_blocks = self.kv_cache_config.num_blocks
                     set_dummy_context(
                         input_batch,
                         self.block_tables,
                         context_len,
-                        self.kv_cache_config.num_blocks,
+                        num_blocks,
                         self.max_model_len,
                         input_block_tables=block_tables,
                     )
@@ -2447,6 +2573,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "kv_caches_by_layer"):
+            self.kv_caches_by_layer.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -2466,6 +2594,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hasattr(self, "model"):
             clear_layer_kv_caches(self.model.modules())
             del self.model
+        # Its views do not keep it alive, and the runner can outlive shutdown
+        # (an in-process engine), so unmap the extensible KV cache explicitly.
+        if (kv_cache := getattr(self, "extensible_kv_cache", None)) is not None:
+            kv_cache.free()
+            self.extensible_kv_cache = None
 
         gc.collect()
         torch.accelerator.empty_cache()

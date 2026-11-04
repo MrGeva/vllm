@@ -20,7 +20,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config, iter_rope_parameters
 from vllm.transformers_utils.repo_utils import get_subfolder_path
 from vllm.utils.hashing import safe_hash
-from vllm.utils.import_utils import LazyLoader, has_arctic_inference
+from vllm.utils.import_utils import LazyLoader
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.speculator_config import (
     SpeculatorConfig,
@@ -104,6 +104,7 @@ _QWEN3_OMNI_DSPARK_ARCHITECTURE = "Qwen3OmniDSparkModel"
 # See `SpeculatorConfig.supported_options`.
 _METHOD_SPECIFIC_OPTIONS = (
     "dspark_draft_topk",
+    "dspark_tp_markov_sampling",
     "draft_lm_head_quantization",
     "index_share_for_mtp_iteration",
     "xpress_topc",
@@ -599,6 +600,12 @@ class SpeculativeConfig:
     suffix tree is disabled and past responses are not cached (prompt trees
     are still used)."""
 
+    suffix_decoding_corpus_tokens: int = 1 << 20
+    """Model Runner V2 only: token capacity of the GPU corpus of finished
+    responses used for cross-request matching. Oldest responses are
+    overwritten first. Set 0 (or `suffix_decoding_max_cached_requests` to 0)
+    to match only within each request's own prompt and output."""
+
     suffix_decoding_max_spec_factor: float = 1.0
     """The maximum spec factor for suffix decoding. The spec factor controls
     speculation lengths based on the prefix match length: max_spec_tokens =
@@ -696,6 +703,25 @@ class SpeculativeConfig:
     dspark_draft_topk: int | None = Field(default=None, ge=1)
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
+
+    dspark_tp_markov_sampling: bool | None = None
+    """Experimental. For DSpark drafting with tensor parallelism, run the
+    sequential Markov sampling loop vocab-parallel: each TP rank computes the
+    Markov bias and the Gumbel sample for its share of the vocabulary, and the
+    ranks exchange per-block maxima over symmetric memory. The drafted tokens
+    and cached draft logits are the same as the replicated loop's. Needs CUDA
+    symmetric memory between the TP ranks and probabilistic drafting over the
+    full vocabulary; otherwise the replicated loop runs."""
+
+    vocab_sharded_verification: bool = False
+    """With tensor parallelism, verify drafts without gathering the target
+    logits: each TP rank keeps its share of the vocabulary (whole 8192-column
+    blocks) and runs temperature, top-p and rejection sampling on it, and the
+    ranks exchange small per-block partials over symmetric memory. Top-p is
+    exact. Steps with requests that need the full vocabulary (logprobs, top-k,
+    min_p, logits processors, structured output) are verified as usual.
+    Needs CUDA symmetric memory, probabilistic drafting and a target model that
+    implements `compute_logits_local`."""
 
     xpress_topc: int | None = Field(default=None, ge=0)
     """For XPress drafting, score each Jacobi pass only on the drafter's top-C
@@ -1419,43 +1445,6 @@ class SpeculativeConfig:
     def uses_separate_workspace_lane(self) -> bool:
         """See `SpeculatorConfig.uses_separate_workspace_lane`."""
         return self.speculator_config.uses_separate_workspace_lane
-
-    def _validate_suffix_decoding(self):
-        # V1 model runner only, to be removed with it.
-        if not has_arctic_inference():
-            raise ImportError(
-                "Arctic Inference is required for suffix decoding. "
-                "Install via `pip install arctic-inference==0.1.1`."
-            )
-        if self.num_speculative_tokens is None:
-            # Suffix decoding decides the actual number of speculative tokens
-            # dynamically and treats num_speculative_tokens as a maximum limit.
-            self.num_speculative_tokens = self.suffix_decoding_max_tree_depth
-            logger.warning(
-                "Defaulted num_speculative_tokens to %s for suffix decoding.",
-                self.num_speculative_tokens,
-            )
-        # Validate values
-        if self.suffix_decoding_max_tree_depth < 1:
-            raise ValueError(
-                f"suffix_decoding_max_tree_depth="
-                f"{self.suffix_decoding_max_tree_depth} must be >= 1"
-            )
-        if self.suffix_decoding_max_cached_requests < 0:
-            raise ValueError(
-                f"suffix_decoding_max_cached_requests="
-                f"{self.suffix_decoding_max_cached_requests} must be >= 0"
-            )
-        if self.suffix_decoding_max_spec_factor < 0:
-            raise ValueError(
-                f"suffix_decoding_max_spec_factor="
-                f"{self.suffix_decoding_max_spec_factor} must be >= 0"
-            )
-        if not 0 <= self.suffix_decoding_min_token_prob <= 1:
-            raise ValueError(
-                f"suffix_decoding_min_token_prob="
-                f"{self.suffix_decoding_min_token_prob} must be in [0, 1]"
-            )
 
     @staticmethod
     def _maybe_override_draft_max_model_len(
