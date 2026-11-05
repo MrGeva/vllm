@@ -15,6 +15,7 @@ The MiniMax-M3-preview config selects a single set of branches:
 import contextlib
 import functools
 from collections.abc import Iterable
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -29,6 +30,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -117,6 +119,7 @@ from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
+    sp_reduce_scatter,
     sp_shard,
 )
 from vllm.models.minimax_m3.common.encoder_cudagraph import (
@@ -169,6 +172,57 @@ FUSED_MOE_FINALIZE_MAX_TOKENS = 512
 FUSED_MOE_FINALIZE_ONE_SHOT_MAX_TOKENS = 64
 
 _QKV_FUSED_EPILOGUE_MIN_TOKENS = 512
+
+# [mixstep port of egeva/m31-mixstep-allreduce onto the image's 36ae880 model]
+# Batches of at least this many tokens keep the residual stream sharded by token
+# across TP ranks (see the branch for the full rationale).
+_SEQUENCE_PARALLEL_MIN_TOKENS = 4096
+_GEMM_RS_MIN_TOKENS = 1024
+
+
+def _use_large_batch_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    return (
+        current_platform.is_cuda()
+        and parallel_config.tensor_parallel_size > 1
+        and parallel_config.pipeline_parallel_size == 1
+        and not parallel_config.enable_expert_parallel
+        and not parallel_config.use_ubatching
+        and not envs.VLLM_BATCH_INVARIANT
+        and vllm_config.scheduler_config.max_num_batched_tokens
+        >= _SEQUENCE_PARALLEL_MIN_TOKENS
+    )
+
+
+def _row_parallel_reduce_scatter(x, linear, gemm_rs) -> torch.Tensor:
+    num_tokens = x.orig_shape[0] if isinstance(x, QuantizedActivation) else x.shape[0]
+    if gemm_rs is not None and num_tokens >= _GEMM_RS_MIN_TOKENS:
+        return gemm_rs.apply(x, linear)
+    x, _ = linear(x)
+    return sp_reduce_scatter(x)
+
+
+def _sp_all_gather_input(x, num_tokens: int):
+    if isinstance(x, torch.Tensor):
+        return sp_all_gather(x)[:num_tokens]
+    assert x.data.shape[0] % 128 == 0, x.data.shape
+    data, scale = get_tp_group().all_gatherv([x.data, x.scale])
+    return QuantizedActivation(
+        data=data[:num_tokens],
+        scale=scale,
+        orig_dtype=x.orig_dtype,
+        orig_shape=torch.Size((num_tokens, *x.orig_shape[1:])),
+        quant_key=x.quant_key,
+    )
+
+
+def _quantize_shard_mxfp8(x: torch.Tensor) -> QuantizedActivation:
+    # The image's norm emits BF16 only (main fuses this into norm_mxfp8).
+    q, sf = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=True)
+    return QuantizedActivation(
+        data=q, scale=sf.view(torch.uint8).reshape(-1), orig_dtype=x.dtype,
+        orig_shape=x.shape, quant_key=kMxfp8Dynamic,
+    )
 
 
 def _supports_qkv_fused_epilogue(attn: "MiniMaxM3SparseAttention") -> bool:
@@ -286,6 +340,24 @@ def _mega_moe_expert_weight(
     return name, weight
 
 
+@contextmanager
+def _deferring(moe_config, max_num_tokens: int, enable: bool = True):
+    """Let the experts defer calls of up to ``max_num_tokens`` for a while."""
+    if not enable:
+        yield
+        return
+    saved = moe_config._defer_moe_finalize, moe_config.defer_moe_finalize_max_num_tokens
+    moe_config._defer_moe_finalize = True
+    moe_config.defer_moe_finalize_max_num_tokens = max_num_tokens
+    try:
+        yield
+    finally:
+        (
+            moe_config._defer_moe_finalize,
+            moe_config.defer_moe_finalize_max_num_tokens,
+        ) = saved
+
+
 class MiniMAXGemmaRMSNorm(nn.Module):
     """Gemma-style RMS normalization backed by FlashInfer kernels.
 
@@ -371,7 +443,9 @@ class MiniMaxM3MLP(nn.Module):
                 envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sequence_parallel: bool = False) -> torch.Tensor:
+        if sequence_parallel:
+            x = sp_all_gather(x)
         num_tokens = x.shape[0]
         # Run unfused under FlashInfer autotuning so gate_up_proj is tuned too
         if (
@@ -387,6 +461,10 @@ class MiniMaxM3MLP(nn.Module):
         else:
             gate_up, _ = self.gate_up_proj(x)
             x = self.act_fn(gate_up)
+        if sequence_parallel:
+            return _row_parallel_reduce_scatter(
+                x, self.down_proj, getattr(self, "gemm_rs", None)
+            )
         x, _ = self.down_proj(x)
         return x
 
@@ -414,6 +492,7 @@ class MiniMaxM3MoE(nn.Module):
 
         self.use_mega_moe = use_mega_moe
         self.reduce_results = reduce_results
+        self.sharded_finalize_max_tokens = 0
         self.scoring_func = config.scoring_func
         self.top_k = config.num_experts_per_tok
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
@@ -555,11 +634,18 @@ class MiniMaxM3MoE(nn.Module):
             return not self.reduce_results
         return self.experts.moe_config.skip_final_all_reduce
 
-    def defer_finalize(self, max_num_tokens: int) -> bool:
+    def defer_finalize(self, max_num_tokens: int, *, sharded: bool = False) -> bool:
         """Leave the routed top-k reduction of calls up to ``max_num_tokens``
         to the consumer; return whether the experts accepted.
 
-        Only the TRTLLM-Gen NVFP4 experts can stop after GEMM2.
+        Replicated batches are finalized by the next all-reduce: the experts
+        then defer every call up to ``max_num_tokens`` and the layer must call
+        ``forward_unfinalized``. Token-sharded batches (``sharded``) are
+        finalized by the next norm's reduce-scatter; they defer only inside
+        ``forward_unfinalized(sharded=True)``, so the experts' deferral state
+        is left as it is. Call it before any replicated deferral, which lowers
+        the experts' limit. Only the TRTLLM-Gen NVFP4 experts can stop after
+        GEMM2.
         """
         if self.use_mega_moe:
             return False
@@ -569,10 +655,25 @@ class MiniMaxM3MoE(nn.Module):
         if experts_cls not in (TrtLlmNvFp4ExpertsMonolithic, TrtLlmNvFp4ExpertsModular):
             return False
         moe_config = self.experts.moe_config
-        moe_config.defer_moe_finalize(max_num_tokens)
-        return moe_config.use_deferred_moe_finalize
+        if not sharded:
+            moe_config.defer_moe_finalize(max_num_tokens)
+            return moe_config.use_deferred_moe_finalize
+        # The experts' own limit (a chunked call finalizes per launch).
+        limit = moe_config.defer_moe_finalize_max_num_tokens
+        with _deferring(moe_config, max_num_tokens):
+            if not moe_config.use_deferred_moe_finalize:
+                return False
+        self.sharded_finalize_max_tokens = (
+            max_num_tokens if limit < 0 else min(limit, max_num_tokens)
+        )
+        return True
 
-    def defers_finalize(self, num_tokens: int) -> bool:
+    def defers_finalize(self, num_tokens: int, sharded: bool = False) -> bool:
+        """Whether this call leaves its finalize to the consumer: the next
+        all-reduce for a replicated batch, the next reduce-scatter for a
+        token-sharded one."""
+        if sharded:
+            return 0 < num_tokens <= self.sharded_finalize_max_tokens
         return (
             not self.use_mega_moe
             and self.experts.moe_config.should_defer_moe_finalize(num_tokens)
@@ -621,11 +722,16 @@ class MiniMaxM3MoE(nn.Module):
             hidden_states, quantized
         )
 
-    def forward_unfinalized(self, hidden_states: torch.Tensor) -> MoEOutput:
+    def forward_unfinalized(
+        self, hidden_states: torch.Tensor, sharded: bool = False
+    ) -> MoEOutput:
         """``forward`` with the routed top-k reduction and all-reduce left open."""
         router_logits, prequantized = self._gate(hidden_states)
+        # Replicated calls of a sharded call's size finalize; this one defers.
         # The runner's custom op returns tensors only, so run its body directly.
-        with prequantized:
+        with prequantized, _deferring(
+            self.experts.moe_config, hidden_states.shape[0], sharded
+        ):
             shared_output, routed = _unpack(
                 self.experts._forward_impl(hidden_states, router_logits, hidden_states)
             )
@@ -775,6 +881,7 @@ class MiniMaxM3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         # Fused per-head Gemma QK-norm + partial NeoX RoPE on q/k, in place.
@@ -793,6 +900,10 @@ class MiniMaxM3Attention(nn.Module):
         )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v)
+        if sequence_parallel:
+            return _row_parallel_reduce_scatter(
+                attn_output, self.o_proj, getattr(self, "gemm_rs", None)
+            )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1054,6 +1165,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor | QuantizedActivation,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         rotary_dim = self.rotary_emb.rotary_dim
@@ -1067,7 +1179,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
             qkv, _ = self.qkv_proj(hidden_states)
             self.indexer.reserve_workspace()
-            return qkv.new_zeros((qkv.shape[0], self.hidden_size))
+            output = qkv.new_zeros((qkv.shape[0], self.hidden_size))
+            return sp_shard(output) if sequence_parallel else output
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
@@ -1142,6 +1255,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         output = torch.empty((num_tokens, self.q_size), dtype=dtype, device=device)
         attn_output = self._run_attention(q, index_q, output)
+        if sequence_parallel:
+            return _row_parallel_reduce_scatter(
+                attn_output, self.o_proj, getattr(self, "gemm_rs", None)
+            )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1256,13 +1373,35 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor | MoEOutput,
         residual: torch.Tensor | None,
+        sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor | MoEOutput, torch.Tensor]:
-        hidden_states, residual = self.forward_input_norm(hidden_states, residual)
-        return self.forward_after_input_norm(positions, hidden_states, residual)
+        hidden_states, residual = self.forward_input_norm(
+            hidden_states, residual, sequence_parallel
+        )
+        return self.forward_after_input_norm(
+            positions, hidden_states, residual, sequence_parallel
+        )
 
     def forward_input_norm(
-        self, hidden_states: torch.Tensor | MoEOutput, residual: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor | MoEOutput,
+        residual: torch.Tensor | None,
+        sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor | QuantizedActivation, torch.Tensor]:
+        if isinstance(hidden_states, MoEOutput) and sequence_parallel:
+            from vllm.models.minimax_m3.nvidia.ops.finalize_reduce_scatter import (
+                finalize_reduce_scatter_gemma_rms_norm,
+            )
+
+            return finalize_reduce_scatter_gemma_rms_norm(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+                mxfp8=get_input_quant_key(self.self_attn.qkv_proj) == kMxfp8Dynamic
+                and residual.shape[0] % 128 == 0,
+                generation=self.layer_id % 2,
+            )
         if isinstance(hidden_states, MoEOutput):
             # The preceding MoE left a small batch unfinalized: finalize,
             # all-reduce, norm and MXFP8-quantize the qkv_proj input at once.
@@ -1273,7 +1412,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 self.input_layernorm.weight,
                 self.input_layernorm.variance_epsilon,
             )
-        if self.fuse_input_allreduce and residual is not None:
+        if self.fuse_input_allreduce and residual is not None and not sequence_parallel:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
@@ -1283,6 +1422,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            if (
+                sequence_parallel
+                and hidden_states.shape[0] % 128 == 0
+                and get_input_quant_key(self.self_attn.qkv_proj) == kMxfp8Dynamic
+            ):
+                hidden_states = _quantize_shard_mxfp8(hidden_states)
         return hidden_states, residual
 
     def forward_after_input_norm(
@@ -1290,11 +1435,30 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor | QuantizedActivation,
         residual: torch.Tensor,
+        sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor | MoEOutput, torch.Tensor]:
+        num_tokens = positions.shape[-1]
+        if sequence_parallel:
+            hidden_states = _sp_all_gather_input(hidden_states, num_tokens)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            sequence_parallel=sequence_parallel,
         )
+        if sequence_parallel:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            if not self.is_moe_layer:
+                return self.mlp(hidden_states, sequence_parallel=True), residual
+            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
+            if self.block_sparse_moe.defers_finalize(num_tokens, sharded=True):
+                return (
+                    self.block_sparse_moe.forward_unfinalized(hidden_states, sharded=True),
+                    residual,
+                )
+            hidden_states = self.block_sparse_moe(hidden_states)
+            return sp_reduce_scatter(hidden_states), residual
 
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
@@ -1328,6 +1492,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         quant_config = vllm_config.quant_config
         self.config = config
         self.use_mega_moe = _use_mega_moe(vllm_config)
+        self.large_batch_sequence_parallel = _use_large_batch_sequence_parallel(
+            vllm_config
+        ) and not self.use_mega_moe
 
         self.vocab_size = config.vocab_size
 
@@ -1391,8 +1558,29 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
+        if self.large_batch_sequence_parallel:
+            self._bind_gemm_rs(vllm_config)
         if supports_fused_moe_finalize(vllm_config):
             self._init_fused_moe_finalize()
+
+    def _bind_gemm_rs(self, vllm_config: VllmConfig) -> None:
+        from vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar import (
+            get_gemm_rs_ar,
+            maybe_init_gemm_rs_ar,
+        )
+
+        if not maybe_init_gemm_rs_ar(
+            vllm_config, N=self.config.hidden_size, all_reduce=False
+        ):
+            return
+        gemm_rs = get_gemm_rs_ar()
+        for layer in self.layers[self.start_layer : self.end_layer]:
+            mods = [layer.self_attn]
+            if not layer.is_moe_layer:
+                mods.append(layer.mlp)
+            for mod in mods:
+                lin = mod.o_proj if mod is layer.self_attn else mod.down_proj
+                mod.gemm_rs = gemm_rs if gemm_rs.can_run(lin) else None
 
     def _init_fused_moe_finalize(self) -> None:
         """Let small batches leave a MoE's top-k finalize to the next layer's
@@ -1405,6 +1593,24 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         kernel: every TP rank decides alike.
         """
         layers = self.layers[self.start_layer : self.end_layer]
+        if self.large_batch_sequence_parallel:
+            from vllm.models.minimax_m3.nvidia.ops.finalize_reduce_scatter import (
+                init_sharded_moe_finalize,
+            )
+
+            max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+            sharded = [
+                layer
+                for layer in layers
+                if layer.is_moe_layer
+                and layer.block_sparse_moe.defer_finalize(max_tokens, sharded=True)
+            ]
+            if sharded:
+                init_sharded_moe_finalize(
+                    hidden_size=self.config.hidden_size,
+                    max_num_tokens=max_tokens,
+                    device=torch.device("cuda", torch.accelerator.current_device_index()),
+                )
         deferring = [
             layer.block_sparse_moe
             for layer, successor in zip(layers, layers[1:])
@@ -1455,6 +1661,15 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        num_tokens = hidden_states.shape[0]
+        sequence_parallel = (
+            self.large_batch_sequence_parallel
+            and num_tokens >= _SEQUENCE_PARALLEL_MIN_TOKENS
+            and residual is None
+        )
+        if sequence_parallel:
+            hidden_states = sp_shard(hidden_states)
+
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
 
         # Aux hidden state k is the residual stream entering layer k. Under TP
@@ -1465,14 +1680,16 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         for idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer], start=self.start_layer
         ):
-            hidden_states, residual = layer.forward_input_norm(hidden_states, residual)
+            hidden_states, residual = layer.forward_input_norm(
+                hidden_states, residual, sequence_parallel
+            )
             # A later PP stage's start boundary is captured by the stage before.
             if idx in self.aux_hidden_state_layers and (
                 idx > self.start_layer or get_pp_group().is_first_rank
             ):
                 aux_hidden_states.append(residual.clone())
             hidden_states, residual = layer.forward_after_input_norm(
-                positions, hidden_states, residual
+                positions, hidden_states, residual, sequence_parallel
             )
 
         if not get_pp_group().is_last_rank:
@@ -1488,7 +1705,20 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 }
             )
 
-        if self.fuse_final_norm_allreduce:
+        if isinstance(hidden_states, MoEOutput):
+            from vllm.models.minimax_m3.nvidia.ops.finalize_reduce_scatter import (
+                finalize_reduce_scatter_gemma_rms_norm,
+            )
+
+            hidden_states, residual = finalize_reduce_scatter_gemma_rms_norm(
+                hidden_states,
+                residual,
+                self.norm.weight,
+                self.norm.variance_epsilon,
+                mxfp8=False,
+                generation=self.end_layer % 2,
+            )
+        elif self.fuse_final_norm_allreduce and not sequence_parallel:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.norm
             )
@@ -1496,6 +1726,15 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states, residual = self.norm(hidden_states, residual)
         if self.end_layer in self.aux_hidden_state_layers:
             aux_hidden_states.append(residual.clone())
+
+        if sequence_parallel and aux_hidden_states:
+            # One all-gather for the output and every aux hidden state.
+            hidden_size = hidden_states.shape[-1]
+            packed = torch.cat([hidden_states, *aux_hidden_states], dim=-1)
+            packed = sp_all_gather(packed)[:num_tokens]
+            hidden_states, *aux_hidden_states = packed.split(hidden_size, dim=-1)
+        elif sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
 
         aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
