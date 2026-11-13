@@ -83,6 +83,13 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        # Whether processing may leave -inf in a request's logits (filters,
+        # forcing, logits processors) rather than only scale them.
+        self.may_mask_logits = np.zeros(max_num_reqs, dtype=bool)
+        # Requests whose sampling needs more than temperature and top-p over
+        # the full vocabulary (logits processors, thinking budget, min_p,
+        # top-k, logprobs). Vocab-sharded verification serves only the others.
+        self.needs_full_vocab = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -95,12 +102,21 @@ class Sampler:
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
-        needs_processing |= self.thinking_budget_state.add_request(
+        needs_full_vocab = self.thinking_budget_state.add_request(
             req_idx, sampling_params
         )
         for processor in self.logits_processors:
-            needs_processing |= processor.add_request(req_idx, sampling_params)
-        self.needs_logits_processing[req_idx] = needs_processing
+            needs_full_vocab |= processor.add_request(req_idx, sampling_params)
+        states = self.sampling_states
+        may_mask = states.masks_logits(req_idx) or needs_full_vocab
+        self.needs_logits_processing[req_idx] = needs_processing or may_mask
+        self.may_mask_logits[req_idx] = may_mask
+        self.needs_full_vocab[req_idx] = (
+            needs_full_vocab
+            or states.min_p.np[req_idx] != 0.0
+            or states.top_k.np[req_idx] != states.vocab_size
+            or states.num_logprobs[req_idx] != NO_LOGPROBS
+        )
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
@@ -115,17 +131,11 @@ class Sampler:
         if self.trace_replay_state is not None:
             self.trace_replay_state.apply_staged_writes()
 
-    def get_logprobs_dims(
-        self, idx_mapping_np: np.ndarray, include_token_ids: bool = True
-    ) -> tuple[int, int] | None:
+    def get_logprobs_dims(self, idx_mapping_np: np.ndarray) -> tuple[int, int] | None:
         """(num_logprobs, max_per_req_token_ids) for the given requests, or
         None when none of them want logprobs."""
         max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
-        max_token_ids = (
-            self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np)
-            if include_token_ids
-            else 0
-        )
+        max_token_ids = self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np)
         if max_num_logprobs == NO_LOGPROBS and max_token_ids == 0:
             return None
         num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
